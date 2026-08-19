@@ -5,6 +5,8 @@ from scipy.signal import find_peaks, peak_widths
 from scipy.optimize import curve_fit
 from scipy.ndimage import gaussian_filter1d
 import os
+import uproot
+import awkward
 
 
 
@@ -95,10 +97,11 @@ def compute_photon_signal_single_peak(filepath):
 
 
 
-
+#computes area of peak, baseline level and sigma of baseline
+#input is the file obtained from the 4ch desktop digitizer
 def compute_DAQ_data(filepath):
     """
-    Extracts photon signals using zero-crossing integration with pile-up rejection.
+    Extracts photon signals.
     
     Parameters:
     filepath (str): Path to the CSV file
@@ -192,6 +195,332 @@ def compute_DAQ_data(filepath):
     print(f"Successfully integrated: {len(array_area)}")
 
     return array_area, array_sigma, array_bkg
+
+
+
+#processes files in chunks
+#data obtained from the big digitizer (64ch)
+
+def process_csv_file_in_chunks_pandas(filepath,parquet_name, chunk_size=1000):
+    # Optional: keep track of baselines if you want to plot them later
+    integrated_areas  = []
+    baseline_averages = []
+    sigma_averages    = []
+    channel_ids        = []
+
+    peak_indx  = 580
+    start_indx = 560
+    end_indx   = 650
+
+    for chunk in pd.read_csv(filepath, chunksize=chunk_size):
+        
+        # 1. Grab the event ID and channel id 
+        event_id = chunk['event'].iloc[0]
+        channel_id = chunk['channel'].iloc[0]
+        channel_ids.append(channel_id)
+
+        if chunk['event'].nunique() > 1:
+            raise ValueError(f"Chunk contains multiple events! Chunk started with event {event_id}.")
+        
+        # 2. Filter the chunk for just the baseline samples (0 to 560)
+        baseline_region = chunk[(chunk['sample'] >= 0) & (chunk['sample'] <= start_indx)]
+        
+        # 3. Compute the mean of the 'adc' column for this specific event
+        event_baseline = baseline_region['adc'].mean()
+        baseline_averages.append(event_baseline)
+
+        # 4. Compute the standard deviation (sigma) of the CURRENT event's baseline
+        sigma = baseline_region['adc'].std()
+        sigma_averages.append(sigma)
+
+        # 5. Find the signal window
+        signal_window = chunk[(chunk['sample'] >= start_indx) & (chunk['sample'] <= end_indx)]
+
+        # 6. Calculate the deviation from the baseline
+        deviation = signal_window['adc'] - event_baseline
+
+        # 7. Prepare values for integration
+        # np.abs() handles both negative and positive peaks by looking at magnitude.
+        # If the magnitude of the pulse is > 3*sigma, keep it; otherwise set to 0.
+        y_vals = np.abs(deviation)
+        x_vals = signal_window['sample']
+
+        # 8. Integrate the signal in this region
+        area = np.trapezoid(y_vals, x=x_vals)
+        integrated_areas.append(area)   
+
+    result_df = pd.DataFrame({
+        'channel': channel_ids,
+        'areas'  : integrated_areas,
+        'sigmas' : sigma_averages,
+        'baseline': baseline_averages
+    }) 
+
+    new_path = f'/disk/gfs_atp/hekinc/Master_measurements/{parquet_name}.parquet'      
+
+    result_df.to_parquet(new_path,index=False)
+    return result_df
+
+
+
+#input the root file of the DAQ measurement
+#output a dataframe with channels, baseline, sigmas, area of the peak
+def analyse_root_data(filepath, parquet_name =None):
+    with uproot.open(filepath) as file:
+        tree = file['Events']
+        
+        # Changed to library="np". 
+        # This returns a dictionary: {"ch01": array, "ch02": array, ...}
+        # If your events are all the exact same length, these are ALREADY 2D matrices!
+        data_dict = tree.arrays(filter_name="/^ch[0-9]+$/", library="np")
+    
+    analyzed_data = {}
+    
+    for channel_name, waveforms in data_dict.items():
+        print(f"Processing {channel_name}...")
+        
+        # If your data comes as an array of objects (jagged), we just stack it
+        if waveforms.dtype == 'O': 
+            waveforms = np.vstack(waveforms)
+            
+        # 2. Define the sample windows (waveforms is already a 2D matrix)
+        baseline_window = waveforms[:, 0:500] 
+        peak_window = waveforms[:, 560:650]
+        
+        # 3. Compute baseline and standard deviation
+        baselines = np.mean(baseline_window, axis=1)
+        std_devs = np.std(baseline_window, axis=1)
+        
+        baseline_corrected_peak = peak_window - baselines[:, None]
+        #check if signal is positive (flip if necessary)
+        if np.mean(baseline_corrected_peak) < 0:
+            print(f"  -> Negative polarity detected on {channel_name}. Auto-inverting.")
+            baseline_corrected_peak *= -1
+        
+        # 4. Integrate the area
+        
+        integrals = np.sum(baseline_corrected_peak, axis=1)
+        
+        # 5. Save the results into our dictionary
+        analyzed_data[channel_name] = pd.DataFrame({
+            "channel": channel_name,
+            "baseline": baselines,
+            "std_dev": std_devs,
+            "peak_integral": integrals
+        })
+
+    master_df = pd.concat(analyzed_data.values(), ignore_index=True)
+    
+    # 2. Check if a parquet_name was provided (Fixed syntax: 'is not None')
+    if parquet_name is not None:
+        # Fixed syntax: proper f-string and path joining
+        new_path = f'/disk/gfs_atp/hekinc/Master_measurements/{parquet_name}.parquet'
+        
+        # Save the combined DataFrame
+        master_df.to_parquet(new_path, index=False)
+        print(f"Data successfully saved to {new_path}")
+        
+    return master_df
+
+
+
+#fitting function for dataframe obtained from root file
+def fit_pandas_data(raw_data, channel_name="Data", bins=500, num_peaks_to_fit=18, 
+                            confident_peak_limit=7, manual_mu0=None, manual_gain=None): 
+    
+    # Drop NaN values that might exist in Pandas and convert to float array
+    raw_data = np.array(raw_data.dropna(), dtype=float) 
+    print(f"Processing {len(raw_data)} data points for {channel_name}...") 
+
+    counts, bin_edges = np.histogram(raw_data, bins=bins) 
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2 
+    dx = bin_centers[1] - bin_centers[0] 
+    
+    # We will use this flag to decide what to plot later
+    fit_successful = False
+    popt, pcov = None, None
+
+    # ========================================== 
+    # Step A & B: Find Anchors 
+    # ========================================== 
+    if manual_mu0 is not None and manual_gain is not None: 
+        print("Using manual physics overrides for Pedestal and Gain.") 
+        mu_0_guess = manual_mu0 
+        gain_guess = manual_gain 
+    else: 
+        print("Auto-detecting peaks...") 
+        smoothed_counts = gaussian_filter1d(counts, sigma=1) 
+        peaks, _ = find_peaks( 
+            smoothed_counts,  
+            prominence=np.max(smoothed_counts) * 0.01,  
+            distance=4 
+        ) 
+        
+        global_max_bin = np.argmax(counts) 
+        if not any(abs(p - global_max_bin) <= 5 for p in peaks): 
+            peaks = np.append(peaks, global_max_bin) 
+            peaks = np.sort(peaks) 
+
+        if len(peaks) == 0: 
+            print("Failed to find any peaks. Skipping fit and plotting raw data.")
+            # Note: We do NOT return here anymore, so it falls through to the plot
+        else:
+            idx_0 = peaks[0] 
+            mu_0_guess = bin_centers[idx_0] 
+            
+            if len(peaks) > 1: 
+                gain_guess = bin_centers[peaks[1]] - bin_centers[peaks[0]] 
+            else: 
+                gain_guess = (bin_centers[-1] - bin_centers[0]) / (num_peaks_to_fit / 2) 
+
+    # Only attempt to build bounds and fit if we found peaks (or used manual inputs)
+    if (manual_mu0 is not None) or (len(peaks) > 0):
+        sigma_0_guess = max(dx, 1e-9) 
+        sigma_1_guess = sigma_0_guess * 0.5  
+
+        # ========================================== 
+        # Step C: Build Bounds 
+        # ========================================== 
+        p0 = [] 
+        lower_bounds = [] 
+        upper_bounds = [] 
+
+        A_bg_guess = np.max(counts) * 0.1 
+        lambda_bg_guess = 1.0 / max(np.mean(raw_data), 1e-9) 
+        p0.extend([A_bg_guess, lambda_bg_guess]) 
+        
+        lower_bounds.extend([0, 0]) 
+        upper_bounds.extend([np.max(counts) * 0.5, 5000]) 
+
+        p0.extend([mu_0_guess, sigma_0_guess, gain_guess, sigma_1_guess]) 
+        lower_bounds.extend([bin_centers[0] - dx*10, 1e-12, dx, 1e-12]) 
+        upper_bounds.extend([bin_centers[-1], gain_guess * 1.2, gain_guess * 5, gain_guess * 1.2]) 
+
+        for n in range(num_peaks_to_fit): 
+            expected_mu = mu_0_guess + (n * gain_guess) 
+            if bin_centers[0] <= expected_mu <= bin_centers[-1]: 
+                closest_bin_idx = np.abs(bin_centers - expected_mu).argmin() 
+                A_guess = counts[closest_bin_idx] 
+            else: 
+                A_guess = 1e-9  
+                
+            p0.append(A_guess) 
+            lower_bounds.append(0.0) 
+            upper_bounds.append(np.inf) 
+
+        p0 = np.clip(np.array(p0, dtype=float), np.array(lower_bounds, dtype=float) + 1e-10, np.array(upper_bounds, dtype=float) - 1e-10) 
+
+        # ========================================== 
+        # Step D: Fit the curve 
+        # ========================================== 
+        try: 
+            popt, pcov = curve_fit( 
+                fit_model_physics,  
+                bin_centers,  
+                counts,  
+                p0=p0,  
+                bounds=(lower_bounds, upper_bounds), 
+                maxfev=25000  
+            ) 
+            print("Physics Curve fitting converged successfully!") 
+            fit_successful = True
+        except Exception as e: 
+            print(f"Optimal parameters not found: {e}") 
+            # fit_successful remains False, falling back to raw plot
+
+    # ========================================== 
+    # Step E: Plotting and Output 
+    # ========================================== 
+    plt.figure(figsize=(10, 6)) 
+    
+    # We ALWAYS plot the raw histogram
+    plt.hist(raw_data, bins=bins, alpha=0.5, color='blue', label='Binned Data') 
+    
+    if fit_successful:
+        x_fit = np.linspace(bin_centers[0], bin_centers[-1], 1000) 
+        plt.plot(x_fit, fit_model_physics(x_fit, *popt), color='red', lw=2, label='Total Fit') 
+        
+        A_bg, lambda_bg, mu_0, sigma_0, gain, sigma_1 = popt[0:6] 
+        amplitudes = popt[6:] 
+        
+        print(f"\n--- Physical Fit Results for {channel_name} ---") 
+        print(f"Pedestal (\u03BC_0): {mu_0:.6e}") 
+        print(f"Detector Gain:      {gain:.6e}") 
+        print(f"Pedestal Noise (\u03C3_0): {sigma_0:.6e}") 
+        print(f"1-Photon Noise (\u03C3_1): {sigma_1:.6e}") 
+        print("-" * 28) 
+        
+        tail_sum = np.zeros_like(x_fit) 
+        for n, A in enumerate(amplitudes): 
+            mu_n = mu_0 + n * gain 
+            sigma_n = np.sqrt(sigma_0**2 + n * sigma_1**2) 
+            single_gauss = A * np.exp(-0.5 * ((x_fit - mu_n) / sigma_n)**2) 
+            
+            if n <= confident_peak_limit: 
+                if np.max(single_gauss) > (np.max(counts) * 0.005): 
+                    plt.plot(x_fit, single_gauss, '--', label=f'{n}-Photon') 
+            else: 
+                tail_sum += single_gauss 
+
+        if np.max(tail_sum) > (np.max(counts) * 0.005): 
+            plt.plot(x_fit, tail_sum, color='gray', linestyle='-.', lw=1.5, label='High-Photon Tail') 
+
+        plt.title(f'Histogram of Area - {channel_name}') 
+    else:
+        # If the fit failed, adjust the title to make it obvious
+        plt.title(f'Histogram of Area (FIT FAILED) - {channel_name}') 
+
+    plt.xlabel('ADC Counts (Integral)') 
+    plt.ylabel('Frequency') 
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left') 
+    plt.grid(alpha=0.3) 
+    plt.tight_layout() 
+    plt.show() 
+
+    return popt, pcov
+
+
+# --------------------------------------------------------- 
+# 3. NEW WRAPPER FOR PANDAS DATAFRAME
+# --------------------------------------------------------- 
+def fit_all_channels_in_df(df, column_to_fit="peak_integral", **kwargs):
+    """
+    Iterates through every unique channel in the dataframe, extracts the data,
+    and runs the physics fit on it.
+    
+    Returns a dictionary of the optimized parameters for each channel.
+    """
+    fit_results = {}
+    
+    # Find all unique channels in the DataFrame
+    channels = df['channel'].unique()
+    
+    for ch in channels:
+        print(f"\n=====================================")
+        print(f" STARTING ANALYSIS FOR: {ch}")
+        print(f"=====================================")
+        
+        # Filter the DataFrame for just this channel, and grab the target column
+        channel_data = df[df['channel'] == ch][column_to_fit]
+        
+        # Pass that data to your fitting function
+        popt, pcov = fit_pandas_data(channel_data, channel_name=ch, **kwargs)
+        
+        # Store the results if the fit was successful
+        if popt is not None:
+            fit_results[ch] = {
+                "mu_0": popt[2],
+                "gain": popt[4],
+                "sigma_0": popt[3],
+                "sigma_1": popt[5],
+                "raw_popt": popt,
+                "raw_pcov": pcov
+            }
+            
+    return fit_results
+
+
+
 
 
 
@@ -494,7 +823,7 @@ def analyze_and_fit_physics(raw_data, bins=500, num_peaks_to_fit=18,
 
     plt.xlabel('ADC Counts') 
     plt.ylabel('Frequency') 
-    plt.title('Physics-Constrained SiPM Spectrum Fit') 
+    plt.title('Histogramm of Area') 
     
     # Move legend outside the plot if it gets too crowded 
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left') 
@@ -512,7 +841,7 @@ def analyze_and_fit_physics(raw_data, bins=500, num_peaks_to_fit=18,
 
 
 #function that takes the filepath and frequency and returns 10 sample plots of the signal with the peak, baseline and sigma marked on the plot. The plots should be saved in a folder called "plots" in the current working directory.
-def plot_sample_signals(filepath, num_samples=10):
+def plot_sample_signals(filepath,conditions, num_samples=10, ):
     """
     Plots sample signals from the DAQ data with peak, baseline, and sigma marked.
 
@@ -578,22 +907,39 @@ def plot_sample_signals(filepath, num_samples=10):
 
         # Find peak
         peak_idx = len(t)//2+43
+        start_indx = peak_idx - 35
+        end_indx = peak_idx + 60
+
+        t_window = t[start_indx:end_indx]
+        sig_window = sig[start_indx:end_indx]
+
+        
         #peak_value = sig[peak_idx]
 
         # Plotting
         plt.figure(figsize=(10, 6))
         plt.plot(t, sig, label='Signal', color='blue')
         plt.axhline(y=baseline, color='green', linestyle='--', label='Baseline')
-        plt.axhline(y=baseline + 3 * sigma, color='orange', linestyle='--', label='3 Sigma Threshold')
+        plt.axhline(y=baseline +sigma, color='orange', linestyle='--', label='1 Sigma Threshold')
         plt.axvline(x=t[peak_idx], color='red', linestyle='--', label='Peak')
-        plt.axvline(x=t[peak_idx-35], color='black', linestyle='--', label='Peak-35 Samples')
-        plt.axvline(x=t[peak_idx+60], color='black', linestyle='--', label='Peak+60 Samples')
+        plt.axvline(x=t[start_indx], color='black', linestyle='--', label='Peak-35 Samples')
+        plt.axvline(x=t[end_indx], color='black', linestyle='--', label='Peak+60 Samples')
 
+        #colour the area between three sigma line and the peak
+        
+        plt.fill_between(t_window, sig_window, baseline, 
+                         where=(sig_window > baseline), 
+                         color='purple', alpha=0.3, interpolate=True, label='Peak Area')
      
         
         # It's helpful to include the actual row index in the title and filename
-        plt.title(f'Sample Signal {i+1} (Original Row: {row_idx})')
+        plt.title(
+        f'Sample Signal {i+1} (Original Row: {row_idx})\n'
+        f'Data taken at {float(conditions[0]):.1f} °C / {float(conditions[0])+273.15:.1f} K\n'
+        f'LED: {float(conditions[1]):.1f} V | SiPM Bias: {float(conditions[2]):.1f} V'
+        )
         plt.xlabel('Samples')
+
         plt.ylabel('Signal (ADC)')
         plt.legend()
         plt.grid()
