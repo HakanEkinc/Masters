@@ -10,6 +10,11 @@ import awkward
 import re
 
 
+#Sample window for 64CH digitizer 
+baseline_start_64 = 0 
+baseline_end_64 = 530
+peak_start_64 = 564
+peak_end_64 = 670
 
 
 #Inputs csv generated from Davids Oscilloscope, with the first two columns being time and signal.
@@ -260,7 +265,7 @@ def process_csv_file_in_chunks_pandas(filepath,parquet_name, chunk_size=1000):
 
 #input the root file of the DAQ measurement
 #output a dataframe with channels, baseline, sigmas, area of the peak
-def analyse_root_data(filepath, parquet_name =None):
+def analyse_root_data(filepath, parquet_name =None, new_path = None):
     with uproot.open(filepath) as file:
         tree = file['Events']
         
@@ -279,8 +284,8 @@ def analyse_root_data(filepath, parquet_name =None):
             waveforms = np.vstack(waveforms)
             
         # 2. Define the sample windows (waveforms is already a 2D matrix)
-        baseline_window = waveforms[:, 0:530] 
-        peak_window = waveforms[:, 564:670]
+        baseline_window = waveforms[:, baseline_start_64:baseline_end_64] 
+        peak_window = waveforms[:, peak_start_64:peak_end_64]
         
         # 3. Compute baseline and standard deviation
         baselines = np.mean(baseline_window, axis=1)
@@ -306,14 +311,15 @@ def analyse_root_data(filepath, parquet_name =None):
 
     master_df = pd.concat(analyzed_data.values(), ignore_index=True)
     
-    # 2. Check if a parquet_name was provided (Fixed syntax: 'is not None')
-    if parquet_name is not None:
-        # Fixed syntax: proper f-string and path joining
-        new_path = f'/disk/gfs_atp/hekinc/Master_measurements/{parquet_name}.parquet'
+    # 2. Check if a parquet_name was provided 
+    if new_path is not None:
+        original_name = Path(filepath).parent.name
+        final_parquet_path = Path(new_path) / f"{original_name}.parquet"
+        final_parquet_path.parent.mkdir(parents=True, exist_ok=True)
         
         # Save the combined DataFrame
-        master_df.to_parquet(new_path, index=False)
-        print(f"Data successfully saved to {new_path}")
+        master_df.to_parquet(final_parquet_path, index=False)
+        print(f"Data successfully saved  to {final_parquet_path}")
         
     return master_df
 
@@ -438,7 +444,10 @@ def fit_pandas_data(raw_data, plots, channel_name="Data", bins=500, num_peaks_to
                 mu_n = mu_0 + n * gain
                 sigma_n = np.sqrt(sigma_0**2 + n * sigma_1**2)
                 peak_params.append([mu_n, sigma_n])
-                
+            
+
+
+
         except Exception as e: 
             print(f"Optimal parameters not found: {e}") 
 
@@ -454,10 +463,10 @@ def fit_pandas_data(raw_data, plots, channel_name="Data", bins=500, num_peaks_to
             plt.plot(x_fit, fit_model_physics(x_fit, *popt), color='red', lw=2, label='Total Fit') 
             
             print(f"\n--- Physical Fit Results for {channel_name} ---") 
-            print(f"Pedestal (\u03BC_0): {mu_0:.6e}") 
-            print(f"Detector Gain:      {gain:.6e}") 
-            print(f"Pedestal Noise (\u03C3_0): {sigma_0:.6e}") 
-            print(f"1-Photon Noise (\u03C3_1): {sigma_1:.6e}") 
+            
+            for n, (mu_n, sigma_n) in enumerate(peak_params[:4]):
+                print(f"  {n}-Photon Peak: \u03BC = {mu_n:.6e}, \u03C3 = {sigma_n:.6e}")
+            print("-" * 50) 
             print(f"\u03C7\u00B2 / NDF:           {chi_square:.2f} / {ndf} = {reduced_chi_square:.3f}")
             print("-" * 28) 
             
@@ -861,7 +870,7 @@ def analyze_and_fit_physics(raw_data, bins=500, num_peaks_to_fit=18,
 
 #input a root file with data from several channels
 #plots several randomly picket events for each channel
-def plot_sample_signals_from_root(filepath, conditions, num_samples=4):
+def plot_sample_signals_from_root(filepath, conditions, num_samples=2):
     """
     Plots sample signals from a DAQ ROOT file for all available channels.
 
@@ -905,15 +914,15 @@ def plot_sample_signals_from_root(filepath, conditions, num_samples=4):
                 continue
 
             # Calculate baseline and sigma
-            bkg_end = max(10, int(len(sig) * 0.1))
-            bkg_sig = sig[:bkg_end]
+            bkg_start = baseline_start_64
+            bkg_end = baseline_end_64
+            bkg_sig = sig[bkg_start:bkg_end]
             baseline = np.mean(bkg_sig)
             sigma = np.std(bkg_sig, ddof=1) if len(bkg_sig) > 1 else 0.0
 
             # Find peak window indices
-            peak_idx = 580
-            start_indx = 564
-            end_indx = 670
+            start_indx = peak_start_64
+            end_indx = peak_end_64
 
             # Safety check to ensure window indices are within bounds
             start_indx = max(0, start_indx)
@@ -926,8 +935,8 @@ def plot_sample_signals_from_root(filepath, conditions, num_samples=4):
             plt.figure(figsize=(10, 6))
             plt.plot(t, sig, label=f'Signal ({channel_name})', color='blue')
             plt.axhline(y=baseline, color='green', linestyle='--', label='Baseline')
-            plt.axhline(y=baseline + sigma, color='orange', linestyle='--', label='+1 Sigma')
-            plt.axhline(y=baseline - sigma, color='orange', linestyle=':', label='-1 Sigma')
+            plt.axhline(y=baseline + sigma, color='orange', linestyle='--', label='+/- 1 Sigma')
+            plt.axhline(y=baseline - sigma, color='orange', linestyle='--')
             
             if 0 <= start_indx < len(t):
                 plt.axvline(x=t[start_indx], color='black', linestyle='--', label='Peak window')
@@ -973,6 +982,7 @@ def plot_sample_signals(filepath,conditions, num_samples=10, ):
 
     Parameters:
     filepath (str): Path to the CSV file.
+    conditions (list): Experimental conditions [Temp, LED V, SiPM Bias V].
     num_samples (int): Number of sample plots to generate.
     """
    
@@ -1108,7 +1118,7 @@ def parse_folder_metadata(filepath):
         metadata["pulse_voltage"] = float(voltages[1]) 
         
     # 4. Extract Frequency (e.g., 400hz)
-    freq_match = re.search(r"-(\d+)hz", folder_name)
+    freq_match = re.search(r"[-_](\d+)[hH][zZ]", folder_name)
     if freq_match:
         metadata["frequency_hz"] = float(freq_match.group(1))
         
@@ -1126,5 +1136,18 @@ def parse_folder_metadata(filepath):
     hash_match = re.search(r"-([a-f0-9]{8})$", folder_name)
     if hash_match:
         metadata["run_hash"] = hash_match.group(1)
+
+    # 8. Extract the LED voltage 
+    all_voltages = re.findall(r"[-_]([0-9]+(?:[-.][0-9]+)?)[vV]", folder_name)
+    
+    if all_voltages:
+        # Grab the last match found in the string (e.g., "3-4")
+        last_voltage_str = all_voltages[-1]
         
+        # Replace the hyphen with a dot so Python can read it as a decimal
+        last_voltage_str = last_voltage_str.replace("-", ".")
+        
+        metadata["led_voltage"] = float(last_voltage_str)
+
+
     return metadata
