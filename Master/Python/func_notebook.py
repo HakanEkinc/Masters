@@ -99,6 +99,7 @@ def analyse_root_data(filepath, new_path = None):
 # --------------------------------------------------------- 
 # 1. Physics-Linked Mathematical Model 
 # --------------------------------------------------------- 
+
 def fit_model_physics(x, *params): 
     """ 
     Physics-linked model for SiPM/PMT multi-photon spectra. 
@@ -108,7 +109,8 @@ def fit_model_physics(x, *params):
     params[3]: sigma_0    (Width of the 0-photon pedestal) 
     params[4]: gain       (Distance between adjacent photon peaks) 
     params[5]: sigma_1    (Additional width contribution per photon) 
-    params[6:]: A_0, A_1, A_2... (Amplitudes for each photon peak) 
+    params[6]: C          (Constant baseline offset)
+    params[7:]: A_0, A_1, A_2... (Amplitudes for each photon peak) 
     """ 
     A_bg = params[0] 
     lambda_bg = params[1] 
@@ -116,31 +118,25 @@ def fit_model_physics(x, *params):
     sigma_0 = params[3] 
     gain = params[4] 
     sigma_1 = params[5] 
-    amplitudes = params[6:] 
+    C = params[6]
+    amplitudes = params[7:] 
     
-    # Calculate Exponential Background 
-    y = A_bg * np.exp(-lambda_bg * x) 
+    # Calculate Background (Shifted Exponential + Constant Baseline)
+    y = np.where(x >= mu_0, A_bg * np.exp(-lambda_bg * (x - mu_0)), 0.0) + C
     
     # Add Physics-Linked Gaussians 
     for n, A in enumerate(amplitudes): 
-        # Position: Pedestal + (n * Gain) 
         mu_n = mu_0 + n * gain 
-        
-        # Width: Add standard deviations in quadrature (Poisson statistics) 
         sigma_n = np.sqrt(sigma_0**2 + n * sigma_1**2) 
-        
-        # Add the specific Gaussian to the total line 
         y += A * np.exp(-0.5 * ((x - mu_n) / sigma_n)**2) 
         
     return y
 
-#fitting function for dataframe obtained from root file
 
 def fit_pandas_data(raw_data, channel_name="Data", bins=500, num_peaks_to_fit=18, 
                     confident_peak_limit=7, manual_mu0=None, manual_gain=None, ax=None,
-                    max_reduced_chi2= None): 
+                    max_reduced_chi2=None): 
     
-    # Drop NaN values that might exist in Pandas and convert to float array
     raw_data = np.array(raw_data.dropna(), dtype=float) 
     print(f"Processing {len(raw_data)} data points for {channel_name}...") 
 
@@ -148,19 +144,14 @@ def fit_pandas_data(raw_data, channel_name="Data", bins=500, num_peaks_to_fit=18
     bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2 
     dx = bin_centers[1] - bin_centers[0] 
     
-    # Initialize return variables
     fit_successful = False
     popt, pcov = None, None
-    peak_params = [] # Array to hold (mu, sigma) for each peak
+    peak_params = [] 
     
-    # Initialize chi-square variables so they exist for the plotting step
     reduced_chi_square = np.nan
     chi_square = np.nan
     ndf = 0
 
-    # ========================================== 
-    # Step A & B: Find Anchors 
-    # ========================================== 
     if manual_mu0 is not None and manual_gain is not None: 
         print("Using manual physics overrides for Pedestal and Gain.") 
         mu_0_guess = manual_mu0 
@@ -190,28 +181,29 @@ def fit_pandas_data(raw_data, channel_name="Data", bins=500, num_peaks_to_fit=18
             else: 
                 gain_guess = (bin_centers[-1] - bin_centers[0]) / (num_peaks_to_fit / 2) 
 
-    # Only attempt to build bounds and fit if we found peaks (or used manual inputs)
     if (manual_mu0 is not None) or (len(peaks) > 0):
         sigma_0_guess = max(dx, 1e-9) 
         sigma_1_guess = sigma_0_guess * 0.5  
 
-        # ========================================== 
-        # Step C: Build Bounds 
-        # ========================================== 
         p0 = [] 
         lower_bounds = [] 
         upper_bounds = [] 
 
         A_bg_guess = np.max(counts) * 0.1 
-        lambda_bg_guess = 1.0 / max(np.mean(raw_data), 1e-9) 
+        lambda_bg_guess = 1.0 / max(np.abs(np.mean(raw_data)), 1.0) 
         p0.extend([A_bg_guess, lambda_bg_guess]) 
-        
         lower_bounds.extend([0, 0]) 
         upper_bounds.extend([np.max(counts) * 0.5, 5000]) 
 
         p0.extend([mu_0_guess, sigma_0_guess, gain_guess, sigma_1_guess]) 
         lower_bounds.extend([bin_centers[0] - dx*10, 1e-12, dx, 1e-12]) 
         upper_bounds.extend([bin_centers[-1], gain_guess * 1.2, gain_guess * 5, gain_guess * 1.2]) 
+
+        # Add Baseline Constant Bounds (Index 6)
+        C_guess = 1.0
+        p0.append(C_guess)
+        lower_bounds.append(0.0)
+        upper_bounds.append(np.max(counts) * 0.1)
 
         for n in range(num_peaks_to_fit): 
             expected_mu = mu_0_guess + (n * gain_guess) 
@@ -227,41 +219,41 @@ def fit_pandas_data(raw_data, channel_name="Data", bins=500, num_peaks_to_fit=18
 
         p0 = np.clip(np.array(p0, dtype=float), np.array(lower_bounds, dtype=float) + 1e-10, np.array(upper_bounds, dtype=float) - 1e-10) 
 
-        # ========================================== 
-        # Step D: Fit the curve & Check Thresholds
-        # ========================================== 
+        # Poisson error + 2% systematic error floor
+        y_err = np.maximum(np.sqrt(counts), 1.0) + (0.02 * counts)
+
         try: 
             popt_temp, pcov_temp = curve_fit( 
                 fit_model_physics,  
                 bin_centers,  
                 counts,  
-                p0=p0,  
+                p0=p0, 
+                sigma=y_err,          
+                absolute_sigma=True,  
                 bounds=(lower_bounds, upper_bounds), 
                 maxfev=25000  
             ) 
             
-            # Calculate chi-square on the temporary fit
             expected_counts = fit_model_physics(bin_centers, *popt_temp)
-            valid_bins = counts > 0
-            O_i = counts[valid_bins]
-            E_i = expected_counts[valid_bins]
             
-            chi_square = np.sum(((O_i - E_i) ** 2) / O_i)
-            ndf = len(O_i) - len(popt_temp)
+            # Use the exact same weighting used in the optimizer for chi-square
+            variances = y_err ** 2
+            
+            chi_square = np.sum(((counts - expected_counts) ** 2) / variances)
+            ndf = len(counts) - len(popt_temp)
             reduced_chi_square = chi_square / ndf if ndf > 0 else np.nan
             
-            # --- NEW THRESHOLD LOGIC ---
             if max_reduced_chi2 is not None and reduced_chi_square > max_reduced_chi2:
                 print(f"Fit rejected: Reduced \u03C7\u00B2 ({reduced_chi_square:.2f}) > threshold ({max_reduced_chi2}).")
-                # Leave fit_successful as False, popt as None
             else:
                 print("Physics Curve fitting converged successfully!") 
                 fit_successful = True
                 popt = popt_temp
                 pcov = pcov_temp
                 
-                A_bg, lambda_bg, mu_0, sigma_0, gain, sigma_1 = popt[0:6] 
-                amplitudes = popt[6:] 
+                # Unpack the 7 physical parameters
+                A_bg, lambda_bg, mu_0, sigma_0, gain, sigma_1, C = popt[0:7] 
+                amplitudes = popt[7:] 
                 
                 for n in range(len(amplitudes)):
                     mu_n = mu_0 + n * gain
@@ -271,9 +263,6 @@ def fit_pandas_data(raw_data, channel_name="Data", bins=500, num_peaks_to_fit=18
         except Exception as e: 
             print(f"Optimal parameters not found: {e}") 
 
-    # ========================================== 
-    # Step E: Plotting to the provided Axis 
-    # ========================================== 
     if ax is not None:
         ax.hist(raw_data, bins=bins, alpha=0.5, color='blue', label='Binned Data') 
         
@@ -290,7 +279,7 @@ def fit_pandas_data(raw_data, channel_name="Data", bins=500, num_peaks_to_fit=18
             
             tail_sum = np.zeros_like(x_fit) 
             for n, (mu_n, sigma_n) in enumerate(peak_params): 
-                A = amplitudes[n]
+                A = popt[7 + n]
                 single_gauss = A * np.exp(-0.5 * ((x_fit - mu_n) / sigma_n)**2) 
                 
                 if n <= confident_peak_limit: 
@@ -304,7 +293,6 @@ def fit_pandas_data(raw_data, channel_name="Data", bins=500, num_peaks_to_fit=18
 
             ax.set_title(f'{channel_name}, with \u03C7\u00B2/NDF = {reduced_chi_square:.3f}') 
         else:
-            # Check why it failed to give a helpful plot title
             if not np.isnan(reduced_chi_square) and max_reduced_chi2 is not None and reduced_chi_square > max_reduced_chi2:
                 ax.set_title(f'{channel_name} (REJECTED: \u03C7\u00B2/NDF > {max_reduced_chi2})') 
             else:
@@ -1449,10 +1437,48 @@ def parse_folder_metadata(filepath):
 #ARCHIVES 
 ################################################################################
 '''
-def fit_pandas_data(raw_data, plots, channel_name="Data", bins=500, num_peaks_to_fit=18, 
-                            confident_peak_limit=7, manual_mu0=None, manual_gain=None): 
+def fit_model_physics(x, *params): 
+    """ 
+    Physics-linked model for SiPM/PMT multi-photon spectra. 
+    params[0]: A_bg       (Exponential background amplitude) 
+    params[1]: lambda_bg  (Exponential background decay rate) 
+    params[2]: mu_0       (Position of the 0-photon pedestal) 
+    params[3]: sigma_0    (Width of the 0-photon pedestal) 
+    params[4]: gain       (Distance between adjacent photon peaks) 
+    params[5]: sigma_1    (Additional width contribution per photon) 
+    params[6:]: A_0, A_1, A_2... (Amplitudes for each photon peak) 
+    """ 
+    A_bg = params[0] 
+    lambda_bg = params[1] 
+    mu_0 = params[2] 
+    sigma_0 = params[3] 
+    gain = params[4] 
+    sigma_1 = params[5] 
+    amplitudes = params[6:] 
     
-# Drop NaN values that might exist in Pandas and convert to float array
+    # Calculate Exponential Background 
+    y = A_bg * np.exp(-lambda_bg * x) 
+    
+    # Add Physics-Linked Gaussians 
+    for n, A in enumerate(amplitudes): 
+        # Position: Pedestal + (n * Gain) 
+        mu_n = mu_0 + n * gain 
+        
+        # Width: Add standard deviations in quadrature (Poisson statistics) 
+        sigma_n = np.sqrt(sigma_0**2 + n * sigma_1**2) 
+        
+        # Add the specific Gaussian to the total line 
+        y += A * np.exp(-0.5 * ((x - mu_n) / sigma_n)**2) 
+        
+    return y
+
+#fitting function for dataframe obtained from root file
+
+def fit_pandas_data(raw_data, channel_name="Data", bins=500, num_peaks_to_fit=18, 
+                    confident_peak_limit=7, manual_mu0=None, manual_gain=None, ax=None,
+                    max_reduced_chi2= None): 
+    
+    # Drop NaN values that might exist in Pandas and convert to float array
     raw_data = np.array(raw_data.dropna(), dtype=float) 
     print(f"Processing {len(raw_data)} data points for {channel_name}...") 
 
@@ -1464,6 +1490,11 @@ def fit_pandas_data(raw_data, plots, channel_name="Data", bins=500, num_peaks_to
     fit_successful = False
     popt, pcov = None, None
     peak_params = [] # Array to hold (mu, sigma) for each peak
+    
+    # Initialize chi-square variables so they exist for the plotting step
+    reduced_chi_square = np.nan
+    chi_square = np.nan
+    ndf = 0
 
     # ========================================== 
     # Step A & B: Find Anchors 
@@ -1535,10 +1566,10 @@ def fit_pandas_data(raw_data, plots, channel_name="Data", bins=500, num_peaks_to
         p0 = np.clip(np.array(p0, dtype=float), np.array(lower_bounds, dtype=float) + 1e-10, np.array(upper_bounds, dtype=float) - 1e-10) 
 
         # ========================================== 
-        # Step D: Fit the curve 
+        # Step D: Fit the curve & Check Thresholds
         # ========================================== 
         try: 
-            popt, pcov = curve_fit( 
+            popt_temp, pcov_temp = curve_fit( 
                 fit_model_physics,  
                 bin_centers,  
                 counts,  
@@ -1546,47 +1577,49 @@ def fit_pandas_data(raw_data, plots, channel_name="Data", bins=500, num_peaks_to
                 bounds=(lower_bounds, upper_bounds), 
                 maxfev=25000  
             ) 
-            print("Physics Curve fitting converged successfully!") 
-            fit_successful = True
-
-            expected_counts = fit_model_physics(bin_centers, *popt)
-                
+            
+            # Calculate chi-square on the temporary fit
+            expected_counts = fit_model_physics(bin_centers, *popt_temp)
             valid_bins = counts > 0
             O_i = counts[valid_bins]
             E_i = expected_counts[valid_bins]
             
             chi_square = np.sum(((O_i - E_i) ** 2) / O_i)
-            ndf = len(O_i) - len(popt)
+            ndf = len(O_i) - len(popt_temp)
             reduced_chi_square = chi_square / ndf if ndf > 0 else np.nan
             
-            # Extract parameters for return, regardless of whether we are plotting
-            A_bg, lambda_bg, mu_0, sigma_0, gain, sigma_1 = popt[0:6] 
-            amplitudes = popt[6:] 
+            # --- NEW THRESHOLD LOGIC ---
+            if max_reduced_chi2 is not None and reduced_chi_square > max_reduced_chi2:
+                print(f"Fit rejected: Reduced \u03C7\u00B2 ({reduced_chi_square:.2f}) > threshold ({max_reduced_chi2}).")
+                # Leave fit_successful as False, popt as None
+            else:
+                print("Physics Curve fitting converged successfully!") 
+                fit_successful = True
+                popt = popt_temp
+                pcov = pcov_temp
+                
+                A_bg, lambda_bg, mu_0, sigma_0, gain, sigma_1 = popt[0:6] 
+                amplitudes = popt[6:] 
+                
+                for n in range(len(amplitudes)):
+                    mu_n = mu_0 + n * gain
+                    sigma_n = np.sqrt(sigma_0**2 + n * sigma_1**2)
+                    peak_params.append([mu_n, sigma_n])
             
-            for n in range(len(amplitudes)):
-                mu_n = mu_0 + n * gain
-                sigma_n = np.sqrt(sigma_0**2 + n * sigma_1**2)
-                peak_params.append([mu_n, sigma_n])
-            
-
-
-
         except Exception as e: 
             print(f"Optimal parameters not found: {e}") 
 
     # ========================================== 
-    # Step E: Plotting and Output 
+    # Step E: Plotting to the provided Axis 
     # ========================================== 
-    if plots == 'yes':
-        plt.figure(figsize=(10, 6)) 
-        plt.hist(raw_data, bins=bins, alpha=0.5, color='blue', label='Binned Data') 
+    if ax is not None:
+        ax.hist(raw_data, bins=bins, alpha=0.5, color='blue', label='Binned Data') 
         
         if fit_successful:
             x_fit = np.linspace(bin_centers[0], bin_centers[-1], 1000) 
-            plt.plot(x_fit, fit_model_physics(x_fit, *popt), color='red', lw=2, label='Total Fit') 
+            ax.plot(x_fit, fit_model_physics(x_fit, *popt), color='red', lw=2, label='Total Fit') 
             
             print(f"\n--- Physical Fit Results for {channel_name} ---") 
-            
             for n, (mu_n, sigma_n) in enumerate(peak_params[:4]):
                 print(f"  {n}-Photon Peak: \u03BC = {mu_n:.6e}, \u03C3 = {sigma_n:.6e}")
             print("-" * 50) 
@@ -1600,25 +1633,26 @@ def fit_pandas_data(raw_data, plots, channel_name="Data", bins=500, num_peaks_to
                 
                 if n <= confident_peak_limit: 
                     if np.max(single_gauss) > (np.max(counts) * 0.005): 
-                        plt.plot(x_fit, single_gauss, '--', label=f'{n}-Photon') 
+                        ax.plot(x_fit, single_gauss, '--', label=f'{n}-Photon') 
                 else: 
                     tail_sum += single_gauss 
 
             if np.max(tail_sum) > (np.max(counts) * 0.005): 
-                plt.plot(x_fit, tail_sum, color='gray', linestyle='-.', lw=1.5, label='High-Photon Tail') 
+                ax.plot(x_fit, tail_sum, color='gray', linestyle='-.', lw=1.5, label='High-Photon Tail') 
 
-            plt.title(f'Histogram of Area - {channel_name}') 
+            ax.set_title(f'{channel_name}, with \u03C7\u00B2/NDF = {reduced_chi_square:.3f}') 
         else:
-            plt.title(f'Histogram of Area (FIT FAILED) - {channel_name}') 
+            # Check why it failed to give a helpful plot title
+            if not np.isnan(reduced_chi_square) and max_reduced_chi2 is not None and reduced_chi_square > max_reduced_chi2:
+                ax.set_title(f'{channel_name} (REJECTED: \u03C7\u00B2/NDF > {max_reduced_chi2})') 
+            else:
+                ax.set_title(f'{channel_name} (FIT FAILED)') 
 
-        plt.xlabel('ADC Counts (Integral)') 
-        plt.ylabel('Frequency') 
-        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left') 
-        plt.grid(alpha=0.3) 
-        plt.tight_layout() 
-        plt.show() 
+        ax.set_xlabel('ADC Counts') 
+        ax.set_ylabel('Frequency') 
+        ax.grid(alpha=0.3) 
 
-    # Return as a numpy array for easy slicing (e.g., peak_params[:, 0] gets all means)
     return popt, pcov, np.array(peak_params)
+
 
 '''
