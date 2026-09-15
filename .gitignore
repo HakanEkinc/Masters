@@ -20,4 +20,6 @@
 /.zshrc
 /PHY451
 /analysis
-/codes
+/codes.venv/
+__pycache__/
+*.pyc
