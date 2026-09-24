@@ -11,6 +11,9 @@ import re
 from pathlib import Path
 import math
 import seaborn as sns
+import gc
+from matplotlib.backends.backend_pdf import PdfPages
+from PIL import Image
 
 
 
@@ -20,9 +23,17 @@ baseline_end_64 = 530
 peak_start_64 = 564
 peak_end_64 = 670
 
+
+#Sample window for 4CH digitizer
+baseline_start_4 = 0
+baseline_end_4 = 700
+peak_start_4 = 760
+peak_end_4 = 850
+
 #Folders where the data will be stored
-parquet_folder = "/disk/gfs_atp/xlzd/alpine/analysis/parquets"
-plot_folder = "/disk/gfs_atp/xlzd/alpine/analysis/plots"
+parquet_folder = "/home/uzh/hekinc/Master/Python/parquets"
+plot_folder = "/home/uzh/hekinc/Master/Python/plots"
+comparisons_folder = "/home/uzh/hekinc/Master/Python/plots/comparisons"
 
 ####################################################################
 #ROOT DATA 
@@ -31,9 +42,14 @@ plot_folder = "/disk/gfs_atp/xlzd/alpine/analysis/plots"
 
 #input the root file of the DAQ measurement
 #output a dataframe with channels, baseline, sigmas, area of the peak
-def analyse_root_data(filepath, new_path = None):
+def analyse_root_data(filepath,device=None, suffix= None):
     with uproot.open(filepath) as file:
-        tree = file['Events']
+
+        print("Available keys in file:", file.keys())
+        if 'Events' in file:
+            tree = file['Events']
+            #print("Available branches in Events:", tree.keys())
+        
         
         # Changed to library="np". 
         # This returns a dictionary: {"ch01": array, "ch02": array, ...}
@@ -41,6 +57,17 @@ def analyse_root_data(filepath, new_path = None):
         data_dict = tree.arrays(filter_name="/^ch[0-9]+$/", library="np")
     
     analyzed_data = {}
+
+    if device != None:
+        baseline_start = baseline_start_4
+        baseline_end = baseline_end_4
+        peak_start = peak_start_4
+        peak_end = peak_end_4
+    else:
+        baseline_start = baseline_start_64
+        baseline_end = baseline_end_64
+        peak_start = peak_start_64
+        peak_end = peak_end_64
     
     for channel_name, waveforms in data_dict.items():
         print(f"Processing {channel_name}...")
@@ -48,46 +75,75 @@ def analyse_root_data(filepath, new_path = None):
         # If your data comes as an array of objects (jagged), we just stack it
         if waveforms.dtype == 'O': 
             waveforms = np.vstack(waveforms)
-            
-        # 2. Define the sample windows (waveforms is already a 2D matrix)
-        baseline_window = waveforms[:, baseline_start_64:baseline_end_64] 
-        peak_window = waveforms[:, peak_start_64:peak_end_64]
-        
-        # 3. Compute baseline and standard deviation
+
+        # 1. Compute baseline 
+        baseline_window = waveforms[:, baseline_start:baseline_end] 
         baselines = np.mean(baseline_window, axis=1)
         std_devs = np.std(baseline_window, axis=1)
+            
+        # 2. Correct the ENTIRE waveform (needed to track down to the baseline)
+        corrected_waveforms = waveforms - baselines[:, None]
+
+        # 3. Isolate the expected peak window for checks
+        corrected_peak_window = corrected_waveforms[:, peak_start:peak_end]
+
+        # 4. Find the peak index ONLY within the hardcoded interval
+        # FIX: Use np.abs() to find the deepest peak, whether it goes up or down
+        peaks = np.argmax(np.abs(corrected_peak_window), axis=1) + peak_start
+
+        # 5. Find left and right baseline crossings (vectorized over the whole waveform)
+        num_samples = corrected_waveforms.shape[1]
+        indices = np.arange(num_samples)
+
+        # FIX: Find the sign of the peak for each waveform (+1 or -1)
+        peak_values = corrected_waveforms[np.arange(len(waveforms)), peaks]
+        peak_signs = np.sign(peak_values)
+        peak_signs[peak_signs == 0] = 1 # Prevent multiplying by 0 if peak is exactly 0
         
-        baseline_corrected_peak = peak_window - baselines[:, None]
-        #check if signal is positive (flip if necessary)
-        if np.mean(baseline_corrected_peak) < 0:
-            print(f"  -> Negative polarity detected on {channel_name}. Auto-inverting.")
-            baseline_corrected_peak *= -1
+        # Temporarily flip negative signals to positive JUST for finding the bounds
+        aligned_waveforms = corrected_waveforms * peak_signs[:, None]
+
+        # Create a boolean mask where the signal is at or below the baseline (0)
+        below_baseline = (aligned_waveforms <= 0)
+
+        # LEFT CROSSING: Find the LAST time it was below baseline BEFORE the peak
+        left_valid = below_baseline & (indices < peaks[:, None])
+        left_crossings = np.max(np.where(left_valid, indices, 0), axis=1)
+
+        # RIGHT CROSSING: Find the FIRST time it falls below baseline AFTER the peak
+        right_valid = below_baseline & (indices > peaks[:, None])
+        right_crossings = np.min(np.where(right_valid, indices, num_samples), axis=1)
+
+        # 6. Integrate the area between the calculated crossings
+        integration_mask = (indices >= left_crossings[:, None]) & (indices <= right_crossings[:, None])
         
-        # 4. Integrate the area
+    
+        # Negative signals will sum to a negative integral area.
+        integrals = np.sum(corrected_waveforms * integration_mask, axis=1)
+
         
-        integrals = np.sum(baseline_corrected_peak, axis=1)
+
         
         # 5. Save the results into our dictionary
         analyzed_data[channel_name] = pd.DataFrame({
             "channel": channel_name,
             "baseline": baselines,
             "std_dev": std_devs,
-            "peak_integral": integrals
+            "peak_integral": integrals,
+            "waveform": list(waveforms)
         })
 
     master_df = pd.concat(analyzed_data.values(), ignore_index=True)
     
-    # 2. Check if a parquet_name was provided 
-    if new_path is not None:
-
-
-        original_name = Path(filepath).parent.name
-        final_parquet_path = Path(new_path) / f"{original_name}.parquet"
-        final_parquet_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Save the combined DataFrame
-        master_df.to_parquet(final_parquet_path, index=False)
-        print(f"Data successfully saved  to {final_parquet_path}")
+    original_name = Path(filepath).parent.name
+    if suffix is not None:
+        original_name += f"_{suffix}"
+    final_parquet_path = Path(parquet_folder) / f"{original_name}.parquet"
+    final_parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Save the combined DataFrame
+    master_df.to_parquet(final_parquet_path, index=False)
+    print(f"Data successfully saved  to {final_parquet_path}")
         
     return master_df, final_parquet_path
 
@@ -306,7 +362,6 @@ def fit_pandas_data(raw_data, channel_name="Data", bins=500, num_peaks_to_fit=18
 
 
 
-
 def process_all_channels_to_single_canvas(data_dict, output_pdf_path="all_channels_summary.pdf"):
     """
     data_dict: dict mapping channel_name to raw_pandas_data 
@@ -351,18 +406,16 @@ def process_all_channels_to_single_canvas(data_dict, output_pdf_path="all_channe
     plt.show()
 
 
-# --------------------------------------------------------- 
-# 3. NEW WRAPPER FOR PANDAS DATAFRAME
-# --------------------------------------------------------- 
 
 
 
-def fit_all_channels_in_df(parquet, column_to_fit="peak_integral", new_path=None, file_id=None, **kwargs):
+
+def fit_all_channels_in_df(parquet, column_to_fit="peak_integral", output_folder=None, file_id=None, **kwargs):
     """
     Iterates through every unique channel in the dataframe, extracts the data,
     and runs the physics fit on it.
     
-    If new_path is provided, it will collect all channel histograms onto a 
+    If output_folder is provided, it will collect all channel histograms onto a 
     single canvas (max 10 per row) and save it as 'all_channels_canvas.pdf' in that directory.
     
     Returns a Pandas DataFrame of the optimized parameters for each channel.
@@ -379,17 +432,34 @@ def fit_all_channels_in_df(parquet, column_to_fit="peak_integral", new_path=None
     # ==========================================
     axes = None
     fig = None
-    if new_path is not None and num_plots > 0:
+    if output_folder is not None and num_plots > 0:
         cols = min(10, num_plots)
-        rows = math.ceil(num_plots / 10)
         
-        fig, axes = plt.subplots(nrows=rows, ncols=cols, figsize=(4 * cols, 3.5 * rows))
+        # Using integer division avoids needing the 'math' module entirely
+        rows = (num_plots - 1) // 10 + 1  
         
-        # Flatten axes array for easy 1D iteration
-        if num_plots > 1:
-            axes = axes.flatten()
-        else:
-            axes = [axes]
+        # squeeze=False guarantees axes is always a 2D numpy array
+        fig, axes = plt.subplots(nrows=rows, ncols=cols, 
+                                figsize=(4 * cols, 3.5 * rows), 
+                                squeeze=False)
+        
+        # Now we can flatten unconditionally
+        axes = axes.flatten()
+    
+    # Hide any unused axes grids
+    for ax in axes[num_plots:]:
+        ax.set_visible(False)
+
+    # Example of your downstream plotting loop:
+    for i in range(num_plots):
+        ax = axes[i]
+        
+        # Set the y-axis to logarithmic scale
+        ax.set_yscale('log')
+        
+        # If you also need the x-axis to be log scale, uncomment this:
+        ax.set_xscale('log')
+    
 
     # ==========================================
     # Iterate and Fit
@@ -411,7 +481,8 @@ def fit_all_channels_in_df(parquet, column_to_fit="peak_integral", new_path=None
             ax=current_ax, 
             **kwargs
         )
-        
+
+
         if popt is not None:
             # Store the baseline properties 
             channel_dict = {
@@ -433,7 +504,7 @@ def fit_all_channels_in_df(parquet, column_to_fit="peak_integral", new_path=None
     # ==========================================
     # Finalize and Save the Canvas
     # ==========================================
-    if new_path is not None and num_plots > 0:
+    if output_folder is not None and num_plots > 0:
         # Hide any unused axes if num_plots isn't a perfect multiple of 10
         for idx in range(num_plots, len(axes)):
             axes[idx].set_visible(False)
@@ -441,8 +512,8 @@ def fit_all_channels_in_df(parquet, column_to_fit="peak_integral", new_path=None
         plt.tight_layout()
         
         # Create directory if it doesn't exist, then save
-        os.makedirs(new_path, exist_ok=True)
-        save_file = os.path.join(new_path, "all_channels_canvas.pdf")
+        os.makedirs(output_folder, exist_ok=True)
+        save_file = os.path.join(output_folder, "all_channels_canvas.pdf")
         plt.savefig(save_file)
         print(f"\nAll plots successfully saved to {save_file}")
         
@@ -467,16 +538,14 @@ def fit_all_channels_in_df(parquet, column_to_fit="peak_integral", new_path=None
 
 #input a root file with data from several channels
 #plots several randomly picket events for each channel
-def plot_sample_signals_from_root(filepath, conditions, num_samples=2, new_path=None):
+def plot_sample_signals_from_root(filepath, num_samples=2, device = None):
     """
     Plots sample signals from a DAQ ROOT file for all available channels 
     on a single grid canvas.
 
     Parameters:
     filepath (str): Path to the ROOT file.
-    conditions (list/tuple): Experimental conditions [Temp, LED V, SiPM Bias V].
     num_samples (int): Number of sample plots to generate per channel.
-    new_path (str): Optional path to save the resulting combined plot.
     """
 
     # 1. Open the ROOT file and extract the data
@@ -489,8 +558,11 @@ def plot_sample_signals_from_root(filepath, conditions, num_samples=2, new_path=
         print("Error: No branches matching '/^ch[0-9]+$/' were found.")
         return
 
+    #extract the metadata from the root file and use it to label the plots
+    metadata = parse_folder_metadata(filepath)
+    conditions = [metadata['temp_c'], metadata['led_voltage'], metadata['bias_voltage']]
+
     # 2. Pre-process and collect all valid signals to plot
-    # This allows us to figure out the exact grid size we need
     plot_tasks = []
     for channel_name in data_dict.keys():
         print(f"Sampling {channel_name}...")
@@ -523,9 +595,8 @@ def plot_sample_signals_from_root(filepath, conditions, num_samples=2, new_path=
     ncols = min(max_cols, total_plots)
     nrows = int(np.ceil(total_plots / ncols))
 
-    # Adjust figsize dynamically based on grid size (e.g., 6 units wide, 4 units tall per plot)
     fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(ncols * 6, nrows * 4.5), squeeze=False)
-    axes = axes.flatten() # Flatten to easily iterate over a 1D array
+    axes = axes.flatten()
 
     # 4. Iterate over collected tasks and plot them on their respective axes
     for i, (channel_name, row_idx, sig) in enumerate(plot_tasks):
@@ -533,22 +604,23 @@ def plot_sample_signals_from_root(filepath, conditions, num_samples=2, new_path=
         t = np.arange(len(sig))
 
         # Calculate baseline and sigma
-        bkg_start = baseline_start_64
-        bkg_end = baseline_end_64
+        if device is not None:
+            bkg_start = baseline_start_4
+            bkg_end = baseline_end_4
+            start_indx = max(0, peak_start_4)
+            end_indx = min(len(t), peak_end_4)
+        else:
+            bkg_start = baseline_start_64
+            bkg_end = baseline_end_64
+            start_indx = max(0, peak_start_64)
+            end_indx = min(len(t), peak_end_64)
+
         bkg_sig = sig[bkg_start:bkg_end]
         baseline = np.mean(bkg_sig)
         sigma = np.std(bkg_sig, ddof=1) if len(bkg_sig) > 1 else 0.0
 
-        # Find peak window indices
-        start_indx = peak_start_64
-        end_indx = peak_end_64
-
-        # Safety check to ensure window indices are within bounds
-        start_indx = max(0, start_indx)
-        end_indx = min(len(t), end_indx)
-
-        t_window = t[start_indx:end_indx]
-        sig_window = sig[start_indx:end_indx]
+       
+       
 
         # Plotting onto the specific axis
         ax.plot(t, sig, label=f'Signal ({channel_name})', color='blue')
@@ -556,25 +628,64 @@ def plot_sample_signals_from_root(filepath, conditions, num_samples=2, new_path=
         ax.axhline(y=baseline + sigma, color='orange', linestyle='--', label='+/- 1 Sigma')
         ax.axhline(y=baseline - sigma, color='orange', linestyle='--')
         
+        # Keep the visual markers for the hardcoded window boundaries
         if 0 <= start_indx < len(t):
-            ax.axvline(x=t[start_indx], color='black', linestyle='--', label='Peak window')
+            ax.axvline(x=t[start_indx], color='black', linestyle='--', label='Hardcoded window')
         if 0 <= end_indx - 1 < len(t):
             ax.axvline(x=t[end_indx - 1], color='black', linestyle='--')
 
-        # Color the area between the baseline and the peak
-        if len(t_window) > 0:
-            max_val = np.max(sig_window)
-            min_val = np.min(sig_window)
+        # --- STRICT SINGLE-PEAK SHADING LOGIC ---
+        sig_window_initial = sig[start_indx:end_indx]
+        
+        if len(sig_window_initial) > 0:
+            # 1. Find the maximum peak inside the hardcoded region
+            max_val = np.max(sig_window_initial)
+            min_val = np.min(sig_window_initial)
             
-            if abs(max_val - baseline) >= abs(min_val - baseline):
+            # Determine if the main peak is positive or negative relative to baseline
+            is_positive_peak = abs(max_val - baseline) >= abs(min_val - baseline)
+            
+            # Find the exact index of this peak in the full signal array
+            if is_positive_peak:
+                peak_idx = start_indx + np.argmax(sig_window_initial)
+            else:
+                peak_idx = start_indx + np.argmin(sig_window_initial)
+                
+            # 2. Walk LEFT from the peak until the first baseline crossing
+            ext_start = peak_idx
+            if is_positive_peak:
+                while ext_start > 0 and sig[ext_start] > baseline:
+                    ext_start -= 1
+            else:
+                while ext_start > 0 and sig[ext_start] < baseline:
+                    ext_start -= 1
+                    
+            # 3. Walk RIGHT from the peak until the first baseline crossing
+            ext_end = peak_idx
+            if is_positive_peak:
+                while ext_end < len(sig) - 1 and sig[ext_end] > baseline:
+                    ext_end += 1
+            else:
+                while ext_end < len(sig) - 1 and sig[ext_end] < baseline:
+                    ext_end += 1
+
+            # 4. Extract just this single peak's strictly bounded window
+            # We add +1 to ext_end to include the boundary point for interpolation
+            t_window = t[ext_start:ext_end + 1]
+            sig_window = sig[ext_start:ext_end + 1]
+
+            # 5. Color the area (strictly one peak, zero chances of multiple baseline crosses)
+            if is_positive_peak:
                 fill_condition = (sig_window > baseline)
             else:
                 fill_condition = (sig_window < baseline)
 
-            ax.fill_between(t_window, sig_window, baseline, 
-                             where=fill_condition, 
-                             color='purple', alpha=0.3, interpolate=True, label='Peak Area')
-     
+            if len(t_window) > 0:
+                ax.fill_between(t_window, sig_window, baseline, 
+                                where=fill_condition, 
+                                color='purple', alpha=0.3, interpolate=True, label='Integrated Peak')
+        # ----------------------------------------
+       
         # Titles and labels
         ax.set_title(
             f'Sample Signal {i+1} (Row: {row_idx}, Ch: {channel_name})\n'
@@ -587,33 +698,209 @@ def plot_sample_signals_from_root(filepath, conditions, num_samples=2, new_path=
         ax.legend(fontsize=8)
         ax.grid(True)
 
-    # 5. Clean up any unused subplots (if total_plots isn't a perfect multiple of max_cols)
+    # 5. Clean up any unused subplots
     for j in range(total_plots, len(axes)):
         fig.delaxes(axes[j])
 
-    # Tight layout prevents overlapping text
     plt.tight_layout()
 
     # 6. Display/Save the combined figure
-    if new_path is not None:
-        original_folder_name = Path(filepath).parent.name
-        save_dir = Path(new_path) / original_folder_name
-        save_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Define a single filename for the canvas
-        plot_filename = "combined_sample_signals.pdf"
-        full_save_path = save_dir / plot_filename
-        
-        plt.savefig(full_save_path, dpi=200) # Added explicit DPI to keep big images sharp
-        print(f"Combined plot saved to: {full_save_path}")
 
-    plt.show() # Display the single big canvas
+    original_folder_name = Path(filepath).parent.name
+    save_dir = Path(plot_folder) / original_folder_name
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    plot_filename = "combined_sample_signals.pdf"
+    full_save_path = save_dir / plot_filename
+    
+    plt.savefig(full_save_path, dpi=200)
+    print(f"Combined plot saved to: {full_save_path}")
 
-    return save_dir if new_path is not None else None
+    plt.show()
+
+    return save_dir 
                 
 
+def plot_sample_signals_from_parquet(filepath, num_samples=2, device=None):
+    """
+    Plots sample signals from a processed Parquet file for all available channels 
+    on a single grid canvas.
+    """
+    # 1. Read the Parquet file
+    df = pd.read_parquet(filepath)
+    
+    if 'waveform' not in df.columns:
+        print("Error: The Parquet file does not contain a 'waveform' column.")
+        print("Please ensure you added 'waveform': list(waveforms) to your analysis function.")
+        return
 
-def plot_waveform_correlations(parquet, new_path=None, channel=None, plot_type='hexbin'):
+    # Extract metadata. Note: Depending on how your parse_folder_metadata works, 
+    # you may need to pass Path(filepath).stem instead if it relies on folder names.
+    metadata = parse_folder_metadata(filepath) 
+    conditions = [metadata['temp_c'], metadata['led_voltage'], metadata['bias_voltage']]
+
+    # 2. Pre-process and collect all valid signals to plot
+    plot_tasks = []
+    channels = df['channel'].unique()
+    
+    for channel_name in channels:
+        print(f"Sampling {channel_name}...")
+        
+        # Isolate the data for the current channel
+        df_channel = df[df['channel'] == channel_name].reset_index(drop=True)
+        total_rows = len(df_channel)
+        actual_num_samples = min(num_samples, total_rows)
+        
+        # Pick random row indices without replacement
+        random_indices = np.random.choice(total_rows, size=actual_num_samples, replace=False)
+        
+        for row_idx in random_indices:
+            # Extract the raw waveform array from the dataframe
+            signal = np.asarray(df_channel.loc[row_idx, 'waveform'], dtype=float)
+            valid_mask = ~np.isnan(signal)
+            sig = signal[valid_mask]
+            
+            # Skip if signal is too short
+            if len(sig) < 50:
+                continue
+                
+            plot_tasks.append((channel_name, row_idx, sig))
+
+    total_plots = len(plot_tasks)
+    if total_plots == 0:
+        print("No valid signals found to plot.")
+        return
+
+    # 3. Setup the subplot grid (max 10 columns)
+    max_cols = 10
+    ncols = min(max_cols, total_plots)
+    nrows = int(np.ceil(total_plots / ncols))
+
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(ncols * 6, nrows * 4.5), squeeze=False)
+    axes = axes.flatten()
+
+    # 4. Iterate over collected tasks and plot them on their respective axes
+    for i, (channel_name, row_idx, sig) in enumerate(plot_tasks):
+        ax = axes[i]
+        t = np.arange(len(sig))
+
+        # Calculate baseline and sigma
+        if device is not None:
+            bkg_start = baseline_start_4
+            bkg_end = baseline_end_4
+            start_indx = max(0, peak_start_4)
+            end_indx = min(len(t), peak_end_4)
+        else:
+            bkg_start = baseline_start_64
+            bkg_end = baseline_end_64
+            start_indx = max(0, peak_start_64)
+            end_indx = min(len(t), peak_end_64)
+
+        bkg_sig = sig[bkg_start:bkg_end]
+        baseline = np.mean(bkg_sig)
+        sigma = np.std(bkg_sig, ddof=1) if len(bkg_sig) > 1 else 0.0
+
+        # Plotting onto the specific axis
+        ax.plot(t, sig, label=f'Signal ({channel_name})', color='blue')
+        ax.axhline(y=baseline, color='green', linestyle='--', label='Baseline')
+        ax.axhline(y=baseline + sigma, color='orange', linestyle='--', label='+/- 1 Sigma')
+        ax.axhline(y=baseline - sigma, color='orange', linestyle='--')
+        
+        # Keep the visual markers for the hardcoded window boundaries
+        if 0 <= start_indx < len(t):
+            ax.axvline(x=t[start_indx], color='black', linestyle='--', label='Hardcoded window')
+        if 0 <= end_indx - 1 < len(t):
+            ax.axvline(x=t[end_indx - 1], color='black', linestyle='--')
+
+        # --- STRICT SINGLE-PEAK SHADING LOGIC ---
+        sig_window_initial = sig[start_indx:end_indx]
+        
+        if len(sig_window_initial) > 0:
+            # 1. Find the maximum peak inside the hardcoded region
+            max_val = np.max(sig_window_initial)
+            min_val = np.min(sig_window_initial)
+            
+            # Determine if the main peak is positive or negative relative to baseline
+            is_positive_peak = abs(max_val - baseline) >= abs(min_val - baseline)
+            
+            # Find the exact index of this peak in the full signal array
+            if is_positive_peak:
+                peak_idx = start_indx + np.argmax(sig_window_initial)
+            else:
+                peak_idx = start_indx + np.argmin(sig_window_initial)
+                
+            # 2. Walk LEFT from the peak until the first baseline crossing
+            ext_start = peak_idx
+            if is_positive_peak:
+                while ext_start > 0 and sig[ext_start] > baseline:
+                    ext_start -= 1
+            else:
+                while ext_start > 0 and sig[ext_start] < baseline:
+                    ext_start -= 1
+                    
+            # 3. Walk RIGHT from the peak until the first baseline crossing
+            ext_end = peak_idx
+            if is_positive_peak:
+                while ext_end < len(sig) - 1 and sig[ext_end] > baseline:
+                    ext_end += 1
+            else:
+                while ext_end < len(sig) - 1 and sig[ext_end] < baseline:
+                    ext_end += 1
+
+            # 4. Extract just this single peak's strictly bounded window
+            t_window = t[ext_start:ext_end + 1]
+            sig_window = sig[ext_start:ext_end + 1]
+
+            # 5. Color the area
+            if is_positive_peak:
+                fill_condition = (sig_window > baseline)
+            else:
+                fill_condition = (sig_window < baseline)
+
+            if len(t_window) > 0:
+                ax.fill_between(t_window, sig_window, baseline, 
+                                where=fill_condition, 
+                                color='purple', alpha=0.3, interpolate=True, label='Integrated Peak')
+        # ----------------------------------------
+       
+        # Titles and labels
+        ax.set_title(
+            f'Sample Signal {i+1} (Row: {row_idx}, Ch: {channel_name})\n'
+            f'{float(conditions[0]):.1f} °C / {float(conditions[0])+273.15:.1f} K\n'
+            f'LED: {float(conditions[1]):.1f} V | SiPM: {float(conditions[2]):.1f} V',
+            fontsize=10
+        )
+        ax.set_xlabel('Samples')
+        ax.set_ylabel('Signal (ADC)')
+        ax.legend(fontsize=8)
+        ax.grid(True)
+
+    # 5. Clean up any unused subplots
+    for j in range(total_plots, len(axes)):
+        fig.delaxes(axes[j])
+
+    plt.tight_layout()
+
+    # 6. Display/Save the combined figure
+    # We use the Parquet file's name (without extension) for the folder name
+    original_name = Path(filepath).stem 
+    save_dir = Path(plot_folder) / original_name
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    plot_filename = "combined_sample_signals.pdf"
+    full_save_path = save_dir / plot_filename
+    
+    plt.savefig(full_save_path, dpi=200)
+    print(f"Combined plot saved to: {full_save_path}")
+
+    plt.show()
+
+    return save_dir
+
+
+
+
+def plot_waveform_correlations(parquet, output_folder=None, channel=None, plot_type='hexbin'):
     """
     Plots baseline vs area, baseline vs sigma, and sigma vs area.
     Creates a grid where each row represents one channel.
@@ -669,8 +956,8 @@ def plot_waveform_correlations(parquet, new_path=None, channel=None, plot_type='
     plt.tight_layout()
 
     # 4. Save the single large grid
-    if new_path is not None:
-        save_dir = Path(new_path)
+    if output_folder is not None:
+        save_dir = Path(output_folder)
         save_dir.mkdir(parents=True, exist_ok=True)
         
         # Name the file dynamically based on whether it's one channel or all
@@ -692,20 +979,379 @@ def plot_waveform_correlations(parquet, new_path=None, channel=None, plot_type='
 def master_function_root(filepath):
 
     #Analse the root file and save the data to a parquet file, return the data and the parquet file path
-    data, parquet_file = analyse_root_data(filepath,parquet_folder)
+    data, parquet_file = analyse_root_data(filepath)
 
-    #extract the metadata from the root file and use it to label the plots
-    metadata = parse_folder_metadata(filepath)
-    conditions = [metadata['temp_c'], metadata['led_voltage'], metadata['bias_voltage']]
 
     #plot randomly selected signals from the root file for each channel, and save the plots to a folder, return save folder path
-    save_dir = plot_sample_signals_from_root(filepath, conditions = conditions, num_samples=2, new_path = plot_folder)
+    save_dir = plot_sample_signals_from_root(filepath, num_samples=2)
 
     #fit the data for each channel obtained from the parquet file
-    fit_df = fit_all_channels_in_df(parquet_file ,new_path = save_dir, column_to_fit="peak_integral",max_reduced_chi2= 100)
+    fit_df = fit_all_channels_in_df(parquet_file ,output_folder = save_dir, column_to_fit="peak_integral",max_reduced_chi2= 100)
 
     #plot the correlations between baseline, sigma and area for each channel, and save the plots to a folder
-    plot_waveform_correlations(parquet_file,new_path = save_dir, channel=None, plot_type='hexbin')
+    plot_waveform_correlations(parquet_file, output_folder=save_dir, channel=None, plot_type='hexbin')
+
+
+def create_all_parquet_files_from_root_folder(root_folder):
+    """
+    Recursively searches for all ROOT files in the specified folder and its subfolders,
+    processes each file, and saves the results to a corresponding Parquet file.
+    """
+    root_folder_path = Path(root_folder)
+    
+    # Find all ROOT files recursively
+    root_files = list(root_folder_path.rglob("*.root"))
+    
+    if not root_files:
+        print(f"No ROOT files found in {root_folder}.")
+        return
+
+    print(f"Found {len(root_files)} ROOT files. Processing...")
+    counter = 1
+    for root_file in root_files:
+        print(f"\nProcessing ROOT file: {counter} / {len(root_files)}")
+        analyse_root_data(root_file)  
+        counter += 1
+
+
+
+
+def process_all_parquet_to_comparison(target_channel,folder, num_samples=2):
+    
+    #find all parquet files and add them to an array
+    parquet_files = get_parquet_files(folder)
+
+    #compare all parquet files for the selected channel
+    compare_parquet_data(parquet_files, target_channel)
+
+
+
+
+def fit_single_channel_data(raw_data, channel, bins=500, num_peaks_to_fit=18, max_reduced_chi2=None): 
+    raw_data = np.array(raw_data.dropna(), dtype=float) 
+    print(f"Processing {len(raw_data)} data points for {channel}...") 
+
+    counts, bin_edges = np.histogram(raw_data, bins=bins) 
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2 
+    dx = bin_centers[1] - bin_centers[0] 
+    
+    y_err = np.maximum(np.sqrt(counts), 1.0) + (0.02 * counts)
+    
+    fit_successful = False
+    popt, pcov = None, None
+    peak_params = [] 
+    expected_counts = None  
+    
+    reduced_chi_square = np.nan
+    chi_square = np.nan
+    ndf = 0
+
+    smoothed_counts = gaussian_filter1d(counts, sigma=1) 
+    peaks, _ = find_peaks( 
+        smoothed_counts,  
+        prominence=np.max(smoothed_counts) * 0.01,  
+        distance=4 
+    ) 
+    
+    global_max_bin = np.argmax(counts) 
+    if not any(abs(p - global_max_bin) <= 5 for p in peaks): 
+        peaks = np.append(peaks, global_max_bin) 
+        peaks = np.sort(peaks) 
+
+    if len(peaks) == 0: 
+        print("Failed to find any peaks. Skipping fit.")
+    else:
+        idx_0 = peaks[0] 
+        mu_0_guess = bin_centers[idx_0] 
+        
+        if len(peaks) > 1: 
+            gain_guess = bin_centers[peaks[1]] - bin_centers[peaks[0]] 
+        else: 
+            gain_guess = (bin_centers[-1] - bin_centers[0]) / (num_peaks_to_fit / 2) 
+
+        sigma_0_guess = max(dx, 1e-9) 
+        sigma_1_guess = sigma_0_guess * 0.5  
+
+        p0, lower_bounds, upper_bounds = [], [], []
+
+        A_bg_guess = np.max(counts) * 0.1 
+        lambda_bg_guess = 1.0 / max(np.abs(np.mean(raw_data)), 1.0) 
+        
+        p0.extend([A_bg_guess, lambda_bg_guess, mu_0_guess, sigma_0_guess, gain_guess, sigma_1_guess]) 
+        lower_bounds.extend([0, 0, bin_centers[0] - dx*10, 1e-12, dx, 1e-12]) 
+        upper_bounds.extend([np.max(counts) * 0.5, 5000, bin_centers[-1], gain_guess * 1.2, gain_guess * 5, gain_guess * 1.2]) 
+
+        # Add Baseline Constant Bounds (Index 6)
+        p0.append(1.0)
+        lower_bounds.append(0.0)
+        upper_bounds.append(np.max(counts) * 0.1)
+
+        for n in range(num_peaks_to_fit): 
+            expected_mu = mu_0_guess + (n * gain_guess) 
+            if bin_centers[0] <= expected_mu <= bin_centers[-1]: 
+                closest_bin_idx = np.abs(bin_centers - expected_mu).argmin() 
+                A_guess = counts[closest_bin_idx] 
+            else: 
+                A_guess = 1e-9  
+                
+            p0.append(A_guess) 
+            lower_bounds.append(0.0) 
+            upper_bounds.append(np.inf) 
+
+        p0 = np.clip(np.array(p0, dtype=float), np.array(lower_bounds, dtype=float) + 1e-10, np.array(upper_bounds, dtype=float) - 1e-10) 
+
+        try: 
+            popt_temp, pcov_temp = curve_fit( 
+                fit_model_physics,  
+                bin_centers,  
+                counts,  
+                p0=p0, 
+                sigma=y_err,          
+                absolute_sigma=True,  
+                bounds=(lower_bounds, upper_bounds), 
+                maxfev=25000  
+            ) 
+            
+            expected_counts = fit_model_physics(bin_centers, *popt_temp)
+            variances = y_err ** 2
+            
+            chi_square = np.sum(((counts - expected_counts) ** 2) / variances)
+            ndf = len(counts) - len(popt_temp)
+            reduced_chi_square = chi_square / ndf if ndf > 0 else np.nan
+            
+            if max_reduced_chi2 is not None and reduced_chi_square > max_reduced_chi2:
+                print(f"Fit rejected: Reduced χ² ({reduced_chi_square:.2f}) > threshold ({max_reduced_chi2}).")
+            else:
+                print("Physics Curve fitting converged successfully!") 
+                fit_successful = True
+                popt = popt_temp
+                pcov = pcov_temp
+                
+                A_bg, lambda_bg, mu_0, sigma_0, gain, sigma_1, C = popt[0:7] 
+                amplitudes = popt[7:] 
+                
+                for n in range(len(amplitudes)):
+                    mu_n = mu_0 + n * gain
+                    sigma_n = np.sqrt(sigma_0**2 + n * sigma_1**2)
+                    peak_params.append([mu_n, sigma_n])
+            
+        except Exception as e: 
+            print(f"Optimal parameters not found: {e}") 
+
+    return {
+        "bin_centers": bin_centers, "bin_edges": bin_edges, "counts": counts,
+        "y_err": y_err, "expected_counts": expected_counts, "popt": popt,
+        "pcov": pcov, "peak_params": np.array(peak_params) if peak_params else np.array([]),
+        "fit_successful": fit_successful, "chi_square": chi_square,
+        "reduced_chi_square": reduced_chi_square, "ndf": ndf
+    }
+
+# --------------------------------------------------------- 
+# 3. Main Plotting Routine
+# --------------------------------------------------------- 
+
+
+def compare_parquet_data(parquet_files, target_channel, bins=500, num_peaks=18, max_reduced_chi2= None):
+    """
+    Reads multiple parquet files, isolates a channel, calculates the fit.
+    Plots each file individually to disk, then stitches them into a gigantic canvas.
+    """
+    total_files = len(parquet_files)
+    cols_to_keep = ['channel', 'peak_integral', 'baseline', 'std_dev']
+    
+    # Prepare save directories
+    save_dir = Path(comparisons_folder)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create a temporary folder for the individual column slices
+    temp_dir = save_dir / "temp_slices"
+    temp_dir.mkdir(exist_ok=True)
+    
+    final_save_path = save_dir / f"{target_channel}_gigantic_canvas.pdf"
+    
+    print(f"Starting plot generation. Total files: {total_files}.")
+    
+    temp_image_paths = []
+    colors = plt.cm.tab10(np.linspace(0, 1, total_files))
+
+    # ==========================================
+    # PHASE 1: Create Individual Plot Columns
+    # ==========================================
+    for col_idx, filepath in enumerate(parquet_files):
+        print(f"--- Processing {col_idx + 1} / {total_files}: {Path(filepath).name} ---")
+        
+        try:
+            df_chan = pd.read_parquet(
+                filepath, 
+                columns=cols_to_keep,
+                filters=[('channel', '==', target_channel)]
+            )
+        except Exception as e:
+            print(f"Error reading {filepath}: {e}")
+            continue
+            
+        # SAFETY CHECK 1: Skip if this specific file doesn't have the channel
+        if df_chan.empty:
+            print(f"  -> Warning: Channel '{target_channel}' not found in this file. Skipping.")
+            continue
+            
+        color = colors[col_idx]
+        
+        # Pass the Pandas Series directly to your fit function
+        full_areas = df_chan['peak_integral']
+        fit_results = fit_single_channel_data(full_areas, target_channel, bins=bins, num_peaks_to_fit=num_peaks,max_reduced_chi2= max_reduced_chi2)
+        
+        # Hexbin Memory Overload Protection
+        MAX_POINTS = 1_000_000
+        if len(df_chan) > MAX_POINTS:
+            plot_df = df_chan.sample(n=MAX_POINTS, random_state=42)
+        else:
+            plot_df = df_chan
+            
+        areas = plot_df['peak_integral'].values
+        baselines = plot_df['baseline'].values
+        sigmas = plot_df['std_dev'].values
+        
+        # Create a single column figure (4 rows, 1 col)
+        fig, axes = plt.subplots(nrows=4, ncols=1, figsize=(7, 18), dpi=300)
+        
+        # Extract metadata
+        metadata = parse_folder_metadata(filepath)
+        conditions = [metadata['temp_c'], metadata['led_voltage'], metadata['bias_voltage']]
+        
+        hex_gridsize = 80
+        hex_cmap = 'viridis'
+
+        # --- Row 0: Histogram ---
+        ax0 = axes[0]
+        ax0.fill_between(fit_results['bin_centers'], fit_results['counts'], step='mid', color=color, alpha=0.4)
+        ax0.plot(fit_results['bin_centers'], fit_results['counts'], drawstyle='steps-mid', color=color, alpha=0.9, linewidth=1.2)
+        
+        if fit_results['fit_successful']:
+            ax0.plot(fit_results['bin_centers'], fit_results['expected_counts'], color='red', linestyle='--', 
+                     label=f"Fit (\u03C7\u00B2/ndf = {fit_results['reduced_chi_square']:.2f})")
+
+        #ax0.set_yscale('log')
+        
+        #ax0.set_yscale('linear')
+        ax0.set_title(f"Histogram & Fit - {target_channel}\n"
+                      f"{float(conditions[0]):.1f} °C / {float(conditions[0])+273.15:.1f} K\n"
+                      f"LED: {float(conditions[1]):.1f} V | SiPM: {float(conditions[2]):.1f} V")
+        ax0.set_xlabel("Area / Integral [a.u.]")
+        ax0.set_ylabel("Counts")
+        ax0.set_ylim(bottom=0)
+        ax0.legend(loc="best")
+        ax0.grid(True, linestyle=':', alpha=0.6)
+        #ax0.set_xlim(-25000,25000)
+
+        # --- Row 1: Baseline vs Area ---
+        ax1 = axes[1]
+        hb1 = ax1.hexbin(areas, baselines, gridsize=hex_gridsize, cmap=hex_cmap, mincnt=1, rasterized=True)
+        fig.colorbar(hb1, ax=ax1, label='Counts')
+        ax1.set_title("Baseline vs Area", fontweight='bold')
+        ax1.set_xlabel("Area")
+        ax1.set_ylabel("Baseline")
+
+        # --- Row 2: Sigma vs Area ---
+        ax2 = axes[2]
+        hb2 = ax2.hexbin(areas, sigmas, gridsize=hex_gridsize, cmap=hex_cmap, mincnt=1, rasterized=True)
+        fig.colorbar(hb2, ax=ax2, label='Counts')
+        ax2.set_title("Sigma vs Area", fontweight='bold')
+        ax2.set_xlabel("Area")
+        ax2.set_ylabel("Sigma")
+
+        # --- Row 3: Baseline vs Sigma ---
+        ax3 = axes[3]
+        hb3 = ax3.hexbin(sigmas, baselines, gridsize=hex_gridsize, cmap=hex_cmap, mincnt=1, rasterized=True)
+        fig.colorbar(hb3, ax=ax3, label='Counts')
+        ax3.set_title("Baseline vs Sigma", fontweight='bold')
+        ax3.set_xlabel("Sigma")
+        ax3.set_ylabel("Baseline")
+
+        # Save this single column as a temporary image
+        plt.tight_layout()
+        temp_img_path = temp_dir / f"col_{col_idx:03d}.png"
+        plt.savefig(temp_img_path, bbox_inches='tight')
+        temp_image_paths.append(temp_img_path)
+
+        # Nuke Matplotlib state to free RAM
+        plt.close('all')
+        del df_chan, plot_df, full_areas, areas, baselines, sigmas
+        gc.collect()
+
+    # ==========================================
+    # PHASE 2: Stitch Images into Gigantic Canvas
+    # ==========================================
+    
+    # SAFETY CHECK 2: Ensure at least one plot was actually created
+    if not temp_image_paths:
+        print(f"\nERROR: Target channel '{target_channel}' was not found in ANY of the provided files.")
+        print("No plots were generated. Cleaning up and exiting.")
+        
+        # Cleanup the empty temp directory
+        try:
+            temp_dir.rmdir()
+        except OSError:
+            pass
+            
+        return  # Exit the function safely
+        
+    print("\n>>> All files processed. Stitching individual plots into a gigantic canvas... <<<")
+    
+    # Open all saved images
+    images = [Image.open(x) for x in temp_image_paths]
+    
+    # Calculate the total dimensions of the final canvas
+    widths, heights = zip(*(i.size for i in images))
+    total_width = sum(widths)
+    max_height = max(heights)
+    
+    # Create a blank white canvas of the exact required size
+    gigantic_canvas = Image.new('RGB', (total_width, max_height), color='white')
+    
+    # Paste each image side-by-side
+    x_offset = 0
+    for img in images:
+        gigantic_canvas.paste(img, (x_offset, 0))
+        x_offset += img.size[0]
+        img.close() # Close to free up file handles
+        
+    # Save the final stitched image
+    gigantic_canvas.save(final_save_path)
+    print(f"\nSUCCESS! Gigantic canvas saved to: {final_save_path}")
+    
+    # Cleanup: Delete the temporary images and the temp folder
+    for p in temp_image_paths:
+        p.unlink()
+    try:
+        temp_dir.rmdir()
+    except OSError:
+        pass
+
+
+def get_parquet_files(folder_path):
+    folder = Path(folder_path)
+    
+    if not folder.is_dir():
+        print(f"Error: The folder '{folder_path}' does not exist.")
+        return []
+
+    # List comprehension that checks if the item is a file and has the .parquet suffix
+    parquet_filepaths = [
+        str(item.absolute()) for item in folder.iterdir() 
+        if item.is_file() and item.suffix.lower() == '.parquet'
+    ]
+    
+    return parquet_filepaths
+    
+
+
+    
+    
+
+
+
+
 
 
 
@@ -952,9 +1598,9 @@ def process_csv_file_in_chunks_pandas(filepath,parquet_name, chunk_size=1000):
         'baseline': baseline_averages
     }) 
 
-    new_path = f'/disk/gfs_atp/hekinc/Master_measurements/{parquet_name}.parquet'      
+    output_folder = f'/disk/gfs_atp/hekinc/Master_measurements/{parquet_name}.parquet'      
 
-    result_df.to_parquet(new_path,index=False)
+    result_df.to_parquet(output_folder,index=False)
     return result_df
 
 
@@ -1353,67 +1999,78 @@ def plot_sample_signals(filepath,conditions, num_samples=10, ):
 
 
 
-def parse_folder_metadata(filepath):
-    """
-    Extracts experimental parameters from the parent folder's name.
-    Example filepath: .../20260814T095731Z-single-ch-100c-2-3-54v-400hz-10ns-3v-5192c7fd/data.csv
-    """
-    # Grab the directory path, then get the final folder name from that path
-    folder_name = os.path.basename(os.path.dirname(filepath))
-    
-    # Initialize a dictionary with the raw folder name
-    metadata = {"raw_folder_name": folder_name}
+def _extract_params(name_string):
+    """Helper function to apply all regex searches to a given string."""
+    metadata = {}
     
     # 1. Extract Timestamp
-    timestamp_match = re.match(r"^(\d{8}T\d{6}Z)", folder_name)
+    timestamp_match = re.match(r"^(\d{8}T\d{6}Z)", name_string)
     if timestamp_match:
         metadata["timestamp"] = timestamp_match.group(1)
         
     # 2. Extract Channel Type
-    ch_match = re.search(r"(single-ch|multi-ch)", folder_name)
+    ch_match = re.search(r"(single-ch|multi-ch)", name_string)
     if ch_match:
         metadata["channel_type"] = ch_match.group(1)
         
     # 3. Extract voltages (e.g., 54v, 3v)
-    voltages = re.findall(r"-(\d+)v", folder_name)
+    voltages = re.findall(r"-(\d+)v", name_string)
     if len(voltages) >= 1:
         metadata["bias_voltage"] = float(voltages[0])  
     if len(voltages) >= 2:
         metadata["pulse_voltage"] = float(voltages[1]) 
         
     # 4. Extract Frequency (e.g., 400hz)
-    freq_match = re.search(r"[-_](\d+)[hH][zZ]", folder_name)
+    freq_match = re.search(r"[-_](\d+)[hH][zZ]", name_string)
     if freq_match:
         metadata["frequency_hz"] = float(freq_match.group(1))
         
     # 5. Extract Time window/pulse width (e.g., 10ns)
-    time_match = re.search(r"-(\d+)ns", folder_name)
+    time_match = re.search(r"-(\d+)ns", name_string)
     if time_match:
         metadata["time_ns"] = float(time_match.group(1))
         
     # 6. Extract Temp/Condition (e.g., 100c)
-    temp_match = re.search(r"-(\d+)c-", folder_name)
+    temp_match = re.search(r"-(\d+)c-", name_string)
     if temp_match:
         metadata["temp_c"] = float(temp_match.group(1))
         
     # 7. Extract the unique trailing hash (e.g., 5192c7fd)
-    hash_match = re.search(r"-([a-f0-9]{8})$", folder_name)
+    hash_match = re.search(r"-([a-f0-9]{8})$", name_string)
     if hash_match:
         metadata["run_hash"] = hash_match.group(1)
 
     # 8. Extract the LED voltage 
-    all_voltages = re.findall(r"[-_]([0-9]+(?:[-.][0-9]+)?)[vV]", folder_name)
-    
+    all_voltages = re.findall(r"[-_]([0-9]+(?:[-.][0-9]+)?)[vV]", name_string)
     if all_voltages:
-        # Grab the last match found in the string (e.g., "3-4")
-        last_voltage_str = all_voltages[-1]
-        
-        # Replace the hyphen with a dot so Python can read it as a decimal
-        last_voltage_str = last_voltage_str.replace("-", ".")
-        
+        last_voltage_str = all_voltages[-1].replace("-", ".")
         metadata["led_voltage"] = float(last_voltage_str)
+        
+    return metadata
 
 
+def parse_folder_metadata(filepath):
+    """
+    Extracts experimental parameters from the parent folder's name, 
+    falling back to the file name if a parameter is missing.
+    """
+    folder_name = os.path.basename(os.path.dirname(filepath))
+    
+    # Grab file name but strip the extension (e.g. ".csv"). 
+    # This ensures your "trailing hash" regex that ends in '$' still works.
+    file_name = os.path.splitext(os.path.basename(filepath))[0]
+    
+    # Extract parameters from both
+    file_meta = _extract_params(file_name)
+    folder_meta = _extract_params(folder_name)
+    
+    # Merge them. **file_meta sets the defaults, **folder_meta overwrites them.
+    metadata = {
+        "raw_folder_name": folder_name,
+        **file_meta,
+        **folder_meta 
+    }
+    
     return metadata
 
 
@@ -1437,6 +2094,238 @@ def parse_folder_metadata(filepath):
 #ARCHIVES 
 ################################################################################
 '''
+def plot_sample_signals_from_root(filepath, num_samples=2, output_folder=None):
+    """
+    Plots sample signals from a DAQ ROOT file for all available channels 
+    on a single grid canvas.
+
+    Parameters:
+    filepath (str): Path to the ROOT file.
+    num_samples (int): Number of sample plots to generate per channel.
+    output_folder (str): Optional path to save the resulting combined plot.
+    """
+
+    # 1. Open the ROOT file and extract the data
+    with uproot.open(filepath) as f:
+        tree = f['Events']
+        # Read branches matching the channel regex into a dictionary of numpy arrays
+        data_dict = tree.arrays(filter_name="/^ch[0-9]+$/", library="np")
+
+    if not data_dict:
+        print("Error: No branches matching '/^ch[0-9]+$/' were found.")
+        return
+
+    #extract the metadata from the root file and use it to label the plots
+    metadata =parse_folder_metadata(filepath)
+    conditions = [metadata['temp_c'], metadata['led_voltage'], metadata['bias_voltage']]
+
+    # 2. Pre-process and collect all valid signals to plot
+    # This allows us to figure out the exact grid size we need
+    plot_tasks = []
+    for channel_name in data_dict.keys():
+        print(f"Sampling {channel_name}...")
+        samples_matrix = data_dict[channel_name]
+        
+        total_rows = len(samples_matrix)
+        actual_num_samples = min(num_samples, total_rows)
+        
+        # Pick random row indices without replacement for the current channel
+        random_indices = np.random.choice(total_rows, size=actual_num_samples, replace=False)
+        
+        for row_idx in random_indices:
+            signal = np.asarray(samples_matrix[row_idx], dtype=float)
+            valid_mask = ~np.isnan(signal)
+            sig = signal[valid_mask]
+            
+            # Skip if signal is too short
+            if len(sig) < 50:
+                continue
+                
+            plot_tasks.append((channel_name, row_idx, sig))
+
+    total_plots = len(plot_tasks)
+    if total_plots == 0:
+        print("No valid signals found to plot.")
+        return
+
+    # 3. Setup the subplot grid (max 10 columns)
+    max_cols = 10
+    ncols = min(max_cols, total_plots)
+    nrows = int(np.ceil(total_plots / ncols))
+
+    # Adjust figsize dynamically based on grid size (e.g., 6 units wide, 4 units tall per plot)
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(ncols * 6, nrows * 4.5), squeeze=False)
+    axes = axes.flatten() # Flatten to easily iterate over a 1D array
+
+    # 4. Iterate over collected tasks and plot them on their respective axes
+    for i, (channel_name, row_idx, sig) in enumerate(plot_tasks):
+        ax = axes[i]
+        t = np.arange(len(sig))
+
+        # Calculate baseline and sigma
+        bkg_start = baseline_start_64
+        bkg_end = baseline_end_64
+        bkg_sig = sig[bkg_start:bkg_end]
+        baseline = np.mean(bkg_sig)
+        sigma = np.std(bkg_sig, ddof=1) if len(bkg_sig) > 1 else 0.0
+
+        # Find peak window indices
+        start_indx = peak_start_64
+        end_indx = peak_end_64
+
+        # Safety check to ensure window indices are within bounds
+        start_indx = max(0, start_indx)
+        end_indx = min(len(t), end_indx)
+
+        t_window = t[start_indx:end_indx]
+        sig_window = sig[start_indx:end_indx]
+
+        # Plotting onto the specific axis
+        ax.plot(t, sig, label=f'Signal ({channel_name})', color='blue')
+        ax.axhline(y=baseline, color='green', linestyle='--', label='Baseline')
+        ax.axhline(y=baseline + sigma, color='orange', linestyle='--', label='+/- 1 Sigma')
+        ax.axhline(y=baseline - sigma, color='orange', linestyle='--')
+        
+        if 0 <= start_indx < len(t):
+            ax.axvline(x=t[start_indx], color='black', linestyle='--', label='Peak window')
+        if 0 <= end_indx - 1 < len(t):
+            ax.axvline(x=t[end_indx - 1], color='black', linestyle='--')
+
+        # Color the area between the baseline and the peak
+        if len(t_window) > 0:
+            max_val = np.max(sig_window)
+            min_val = np.min(sig_window)
+            
+            if abs(max_val - baseline) >= abs(min_val - baseline):
+                fill_condition = (sig_window > baseline)
+            else:
+                fill_condition = (sig_window < baseline)
+
+            ax.fill_between(t_window, sig_window, baseline, 
+                             where=fill_condition, 
+                             color='purple', alpha=0.3, interpolate=True, label='Peak Area')
+     
+        # Titles and labels
+        ax.set_title(
+            f'Sample Signal {i+1} (Row: {row_idx}, Ch: {channel_name})\n'
+            f'{float(conditions[0]):.1f} °C / {float(conditions[0])+273.15:.1f} K\n'
+            f'LED: {float(conditions[1]):.1f} V | SiPM: {float(conditions[2]):.1f} V',
+            fontsize=10
+        )
+        ax.set_xlabel('Samples')
+        ax.set_ylabel('Signal (ADC)')
+        ax.legend(fontsize=8)
+        ax.grid(True)
+
+    # 5. Clean up any unused subplots (if total_plots isn't a perfect multiple of max_cols)
+    for j in range(total_plots, len(axes)):
+        fig.delaxes(axes[j])
+
+    # Tight layout prevents overlapping text
+    plt.tight_layout()
+
+    # 6. Display/Save the combined figure
+    if output_folder is not None:
+        original_folder_name = Path(filepath).parent.name
+        save_dir = Path(output_folder) / original_folder_name
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Define a single filename for the canvas
+        plot_filename = "combined_sample_signals.pdf"
+        full_save_path = save_dir / plot_filename
+        
+        plt.savefig(full_save_path, dpi=200) # Added explicit DPI to keep big images sharp
+        print(f"Combined plot saved to: {full_save_path}")
+
+    plt.show() # Display the single big canvas
+
+    return save_dir if output_folder is not None else None
+
+
+
+
+
+
+
+
+#input the root file of the DAQ measurement
+#output a dataframe with channels, baseline, sigmas, area of the peak
+def analyse_root_data(filepath, output_folder = None):
+    with uproot.open(filepath) as file:
+        tree = file['Events']
+        
+        # Changed to library="np". 
+        # This returns a dictionary: {"ch01": array, "ch02": array, ...}
+        # If your events are all the exact same length, these are ALREADY 2D matrices!
+        data_dict = tree.arrays(filter_name="/^ch[0-9]+$/", library="np")
+    
+    analyzed_data = {}
+    
+    for channel_name, waveforms in data_dict.items():
+        print(f"Processing {channel_name}...")
+        
+        # If your data comes as an array of objects (jagged), we just stack it
+        if waveforms.dtype == 'O': 
+            waveforms = np.vstack(waveforms)
+            
+        # 2. Define the sample windows (waveforms is already a 2D matrix)
+        baseline_window = waveforms[:, baseline_start_64:baseline_end_64] 
+        peak_window = waveforms[:, peak_start_64:peak_end_64]
+        
+        # 3. Compute baseline and standard deviation
+        baselines = np.mean(baseline_window, axis=1)
+        std_devs = np.std(baseline_window, axis=1)
+        
+        baseline_corrected_peak = peak_window - baselines[:, None]
+        #check if signal is positive (flip if necessary)
+        if np.mean(baseline_corrected_peak) < 0:
+            print(f"  -> Negative polarity detected on {channel_name}. Auto-inverting.")
+            baseline_corrected_peak *= -1
+        
+        # 4. Integrate the area
+        
+        integrals = np.sum(baseline_corrected_peak, axis=1)
+        
+        # 5. Save the results into our dictionary
+        analyzed_data[channel_name] = pd.DataFrame({
+            "channel": channel_name,
+            "baseline": baselines,
+            "std_dev": std_devs,
+            "peak_integral": integrals
+        })
+
+    master_df = pd.concat(analyzed_data.values(), ignore_index=True)
+    
+    # 2. Check if a parquet_name was provided 
+    if output_folder is not None:
+
+
+        original_name = Path(filepath).parent.name
+        final_parquet_path = Path(output_folder) / f"{original_name}.parquet"
+        final_parquet_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Save the combined DataFrame
+        master_df.to_parquet(final_parquet_path, index=False)
+        print(f"Data successfully saved  to {final_parquet_path}")
+        
+    return master_df, final_parquet_path   
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def fit_model_physics(x, *params): 
     """ 
     Physics-linked model for SiPM/PMT multi-photon spectra. 
