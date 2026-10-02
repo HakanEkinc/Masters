@@ -449,7 +449,7 @@ def fit_all_channels_in_df(parquet, column_to_fit="peak_integral", output_folder
     # Hide any unused axes grids
     for ax in axes[num_plots:]:
         ax.set_visible(False)
-
+    '''
     # Example of your downstream plotting loop:
     for i in range(num_plots):
         ax = axes[i]
@@ -459,7 +459,7 @@ def fit_all_channels_in_df(parquet, column_to_fit="peak_integral", output_folder
         
         # If you also need the x-axis to be log scale, uncomment this:
         ax.set_xscale('log')
-    
+    '''
 
     # ==========================================
     # Iterate and Fit
@@ -561,6 +561,9 @@ def plot_sample_signals_from_root(filepath, num_samples=2, device = None):
     #extract the metadata from the root file and use it to label the plots
     metadata = parse_folder_metadata(filepath)
     conditions = [metadata['temp_c'], metadata['led_voltage'], metadata['bias_voltage']]
+
+    #check whether values are located inside conditions
+    
 
     # 2. Pre-process and collect all valid signals to plot
     plot_tasks = []
@@ -976,7 +979,7 @@ def plot_waveform_correlations(parquet, output_folder=None, channel=None, plot_t
 
 
 
-def master_function_root(filepath):
+def master_function_root(filepath,max_reduced_chi2= 2):
 
     #Analse the root file and save the data to a parquet file, return the data and the parquet file path
     data, parquet_file = analyse_root_data(filepath)
@@ -986,7 +989,7 @@ def master_function_root(filepath):
     save_dir = plot_sample_signals_from_root(filepath, num_samples=2)
 
     #fit the data for each channel obtained from the parquet file
-    fit_df = fit_all_channels_in_df(parquet_file ,output_folder = save_dir, column_to_fit="peak_integral",max_reduced_chi2= 100)
+    fit_df = fit_all_channels_in_df(parquet_file ,output_folder = save_dir, column_to_fit="peak_integral",max_reduced_chi2= max_reduced_chi2)
 
     #plot the correlations between baseline, sigma and area for each channel, and save the plots to a folder
     plot_waveform_correlations(parquet_file, output_folder=save_dir, channel=None, plot_type='hexbin')
@@ -1016,13 +1019,14 @@ def create_all_parquet_files_from_root_folder(root_folder):
 
 
 
-def process_all_parquet_to_comparison(target_channel,folder, num_samples=2):
+def process_all_parquet_to_comparison(target_channel,parquet_location,num_samples = 2, output_folder=None, max_reduced_chi2= None):
     
     #find all parquet files and add them to an array
-    parquet_files = get_parquet_files(folder)
+    parquet_files = get_parquet_files(parquet_location)
 
     #compare all parquet files for the selected channel
-    compare_parquet_data(parquet_files, target_channel)
+    compare_parquet_data(parquet_files, target_channel, output_folder=output_folder,max_reduced_chi2= max_reduced_chi2)
+
 
 
 
@@ -1151,7 +1155,7 @@ def fit_single_channel_data(raw_data, channel, bins=500, num_peaks_to_fit=18, ma
 # --------------------------------------------------------- 
 
 
-def compare_parquet_data(parquet_files, target_channel, bins=500, num_peaks=18, max_reduced_chi2= None):
+def compare_parquet_data(parquet_files, target_channel, bins=500, num_peaks=18, max_reduced_chi2= None, output_folder = None):
     """
     Reads multiple parquet files, isolates a channel, calculates the fit.
     Plots each file individually to disk, then stitches them into a gigantic canvas.
@@ -1162,10 +1166,16 @@ def compare_parquet_data(parquet_files, target_channel, bins=500, num_peaks=18, 
     # Prepare save directories
     save_dir = Path(comparisons_folder)
     save_dir.mkdir(parents=True, exist_ok=True)
+
+    if output_folder is not None:
+            save_dir = Path(output_folder)
+            save_dir.mkdir(parents=True, exist_ok=True)
     
     # Create a temporary folder for the individual column slices
     temp_dir = save_dir / "temp_slices"
     temp_dir.mkdir(exist_ok=True)
+    
+
     
     final_save_path = save_dir / f"{target_channel}_gigantic_canvas.pdf"
     
@@ -1236,7 +1246,7 @@ def compare_parquet_data(parquet_files, target_channel, bins=500, num_peaks=18, 
         #ax0.set_yscale('linear')
         ax0.set_title(f"Histogram & Fit - {target_channel}\n"
                       f"{float(conditions[0]):.1f} °C / {float(conditions[0])+273.15:.1f} K\n"
-                      f"LED: {float(conditions[1]):.1f} V | SiPM: {float(conditions[2]):.1f} V")
+                      f"LED: {float(conditions[1]):.2f} V | SiPM: {float(conditions[2]):.1f} V")
         ax0.set_xlabel("Area / Integral [a.u.]")
         ax0.set_ylabel("Counts")
         ax0.set_ylim(bottom=0)
@@ -2014,11 +2024,11 @@ def _extract_params(name_string):
         metadata["channel_type"] = ch_match.group(1)
         
     # 3. Extract voltages (e.g., 54v, 3v)
-    voltages = re.findall(r"-(\d+)v", name_string)
+    voltages = re.findall(r"-(\d+(?:\.\d+)?)v", name_string)
     if len(voltages) >= 1:
         metadata["bias_voltage"] = float(voltages[0])  
     if len(voltages) >= 2:
-        metadata["pulse_voltage"] = float(voltages[1]) 
+        metadata["pulse_voltage"] = float(voltages[1])
         
     # 4. Extract Frequency (e.g., 400hz)
     freq_match = re.search(r"[-_](\d+)[hH][zZ]", name_string)
@@ -2031,9 +2041,16 @@ def _extract_params(name_string):
         metadata["time_ns"] = float(time_match.group(1))
         
     # 6. Extract Temp/Condition (e.g., 100c)
-    temp_match = re.search(r"-(\d+)c-", name_string)
+    temp_match = re.search(r"-(-?\d+)c-", name_string)
+
     if temp_match:
-        metadata["temp_c"] = float(temp_match.group(1))
+        temp_val = float(temp_match.group(1))
+    
+        # If the temperature is above 40, automatically make it negative
+        if temp_val > 40:
+            temp_val = -temp_val
+        
+        metadata["temp_c"] = temp_val
         
     # 7. Extract the unique trailing hash (e.g., 5192c7fd)
     hash_match = re.search(r"-([a-f0-9]{8})$", name_string)
