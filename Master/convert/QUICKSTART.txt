@@ -1,0 +1,44 @@
+ALPINE-CONVERT 1.0.0
+====================
+
+INSTALL
+  cd /disk/gfs_atp/xlzd/alpine/convert/alpine-convert-1.0.0
+  ./install.sh
+  source ~/.venvs/alpine-convert/bin/activate
+
+INSPECT
+  alpine-convert inspect FILE
+
+LOCAL ROOT/RAW -> CSV.GZ
+  alpine-convert convert FILE.root
+  alpine-convert convert FILE.raw
+
+LOCAL CSV.GZ -> ROOT
+  alpine-convert convert FILE.csv.gz
+
+SLURM ROOT/RAW -> CSV.GZ
+  alpine-convert submit /path/data --to csv --max-parallel 4
+
+SLURM CSV/CSV.GZ -> ROOT
+  alpine-convert submit /path/data --to root --max-parallel 4
+
+DRY RUN
+  alpine-convert convert /path/data --to csv --dry-run
+  alpine-convert convert /path/data --to root --dry-run
+
+MONITOR
+  squeue -j JOBID
+  sacct -j JOBID --format=JobID,State,ExitCode,Elapsed,NodeList
+
+DEFAULTS
+  CSV output: gzip-compressed wide/reversible layout
+  partition: express
+  max parallel: 4
+  memory/task: 4G
+  time/task: 2h
+  scratch: /scratch
+
+SAFETY
+  Inputs are never deleted.
+  Existing outputs are skipped unless --overwrite is supplied.
+  Slurm converts on local scratch and copies back atomically.
