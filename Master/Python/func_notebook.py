@@ -39,7 +39,7 @@ comparisons_folder = "/home/uzh/hekinc/Master/Python/plots/comparisons"
 #ROOT DATA 
 ####################################################################
 
-
+'''
 #input the root file of the DAQ measurement
 #output a dataframe with channels, baseline, sigmas, area of the peak
 def analyse_root_data(filepath,device=None, suffix= None):
@@ -147,7 +147,87 @@ def analyse_root_data(filepath,device=None, suffix= None):
         
     return master_df, final_parquet_path
 
+'''
 
+def analyse_root_data(filepath, device=None, suffix=None):
+    analyzed_data = [] # List to hold our chunks
+
+    if device is not None:
+        baseline_start, baseline_end = baseline_start_4, baseline_end_4
+        peak_start, peak_end = peak_start_4, peak_end_4
+    else:
+        baseline_start, baseline_end = baseline_start_64, baseline_end_64
+        peak_start, peak_end = peak_start_64, peak_end_64
+
+    # 1. PROCESS IN CHUNKS (e.g., 100 MB of data at a time)
+    # This prevents loading the entire ROOT file into RAM at once.
+    for data_dict in uproot.iterate(f"{filepath}:Events", filter_name="/^ch[0-9]+$/", library="np", step_size="100 MB"):
+        
+        chunk_results = []
+        for channel_name, waveforms in data_dict.items():
+            print(f"Processing chunk for {channel_name}...")
+            
+            if waveforms.dtype == 'O': 
+                waveforms = np.vstack(waveforms)
+
+            baseline_window = waveforms[:, baseline_start:baseline_end] 
+            baselines = np.mean(baseline_window, axis=1)
+            std_devs = np.std(baseline_window, axis=1)
+                
+            corrected_waveforms = waveforms - baselines[:, None]
+            corrected_peak_window = corrected_waveforms[:, peak_start:peak_end]
+            peaks = np.argmax(np.abs(corrected_peak_window), axis=1) + peak_start
+
+            num_samples = corrected_waveforms.shape[1]
+            indices = np.arange(num_samples)
+
+            peak_values = corrected_waveforms[np.arange(len(waveforms)), peaks]
+            peak_signs = np.sign(peak_values)
+            peak_signs[peak_signs == 0] = 1 
+            
+            aligned_waveforms = corrected_waveforms * peak_signs[:, None]
+            below_baseline = (aligned_waveforms <= 0)
+
+            left_valid = below_baseline & (indices < peaks[:, None])
+            left_crossings = np.max(np.where(left_valid, indices, 0), axis=1)
+
+            right_valid = below_baseline & (indices > peaks[:, None])
+            right_crossings = np.min(np.where(right_valid, indices, num_samples), axis=1)
+
+            integration_mask = (indices >= left_crossings[:, None]) & (indices <= right_crossings[:, None])
+            integrals = np.sum(corrected_waveforms * integration_mask, axis=1)
+
+            # 2. DROP THE RAW WAVEFORM FROM THE DATAFRAME
+            # Only save the calculated features to save massive amounts of RAM
+            chunk_results.append(pd.DataFrame({
+                "channel": channel_name,
+                "baseline": baselines,
+                "std_dev": std_devs,
+                "peak_integral": integrals,
+                # "waveform": list(waveforms)  <-- REMOVE THIS
+            }))
+
+            # 3. MANUALLY FREE MEMORY
+            del waveforms, corrected_waveforms, aligned_waveforms, below_baseline
+            del left_valid, right_valid, integration_mask
+            gc.collect()
+
+        analyzed_data.append(pd.concat(chunk_results, ignore_index=True))
+        
+    master_df = pd.concat(analyzed_data, ignore_index=True)
+    
+    original_name = Path(filepath).parent.name
+    if suffix is not None:
+        original_name += f"_{suffix}"
+        
+    final_parquet_path = Path(parquet_folder) / f"{original_name}.parquet"
+    final_parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Save the combined DataFrame
+    master_df.to_parquet(final_parquet_path, index=False)
+    print(f"Data successfully saved  to {final_parquet_path}")
+        
+    return master_df, final_parquet_path
 
 
 
@@ -1019,14 +1099,13 @@ def create_all_parquet_files_from_root_folder(root_folder):
 
 
 
-def process_all_parquet_to_comparison(target_channel,parquet_location,num_samples = 2, output_folder=None, max_reduced_chi2= None):
+def process_all_parquet_to_comparison(target_channel,parquet_location,num_samples = 2, output_folder=None, max_reduced_chi2= None, log=False):
     
     #find all parquet files and add them to an array
     parquet_files = get_parquet_files(parquet_location)
 
     #compare all parquet files for the selected channel
-    compare_parquet_data(parquet_files, target_channel, output_folder=output_folder,max_reduced_chi2= max_reduced_chi2)
-
+    compare_parquet_data(parquet_files, target_channel, output_folder=output_folder,max_reduced_chi2= max_reduced_chi2, log=log)
 
 
 
@@ -1155,7 +1234,7 @@ def fit_single_channel_data(raw_data, channel, bins=500, num_peaks_to_fit=18, ma
 # --------------------------------------------------------- 
 
 
-def compare_parquet_data(parquet_files, target_channel, bins=500, num_peaks=18, max_reduced_chi2= None, output_folder = None):
+def compare_parquet_data(parquet_files, target_channel, bins=500, num_peaks=18, max_reduced_chi2= None, output_folder = None, log = False):
     """
     Reads multiple parquet files, isolates a channel, calculates the fit.
     Plots each file individually to disk, then stitches them into a gigantic canvas.
@@ -1234,14 +1313,18 @@ def compare_parquet_data(parquet_files, target_channel, bins=500, num_peaks=18, 
 
         # --- Row 0: Histogram ---
         ax0 = axes[0]
-        ax0.fill_between(fit_results['bin_centers'], fit_results['counts'], step='mid', color=color, alpha=0.4)
+        # Added y2=0.1 to provide a positive baseline for the log scale
+        ax0.fill_between(fit_results['bin_centers'], fit_results['counts'], y2=0.1, step='mid', color=color, alpha=0.4)
+        
         ax0.plot(fit_results['bin_centers'], fit_results['counts'], drawstyle='steps-mid', color=color, alpha=0.9, linewidth=1.2)
         
         if fit_results['fit_successful']:
             ax0.plot(fit_results['bin_centers'], fit_results['expected_counts'], color='red', linestyle='--', 
                      label=f"Fit (\u03C7\u00B2/ndf = {fit_results['reduced_chi_square']:.2f})")
 
-        #ax0.set_yscale('log')
+        if log == True:
+            ax0.set_yscale('log')
+            ax0.set_ylim(bottom=0.1)
         
         #ax0.set_yscale('linear')
         ax0.set_title(f"Histogram & Fit - {target_channel}\n"
@@ -1252,7 +1335,7 @@ def compare_parquet_data(parquet_files, target_channel, bins=500, num_peaks=18, 
         ax0.set_ylim(bottom=0)
         ax0.legend(loc="best")
         ax0.grid(True, linestyle=':', alpha=0.6)
-        #ax0.set_xlim(-25000,25000)
+        
 
         # --- Row 1: Baseline vs Area ---
         ax1 = axes[1]
