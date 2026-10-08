@@ -1,0 +1,9 @@
+numpy
+pandas
+scipy
+matplotlib
+seaborn
+uproot
+awkward
+pyarrow
+Pillow
