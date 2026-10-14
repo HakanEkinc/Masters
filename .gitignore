@@ -21,6 +21,7 @@
 /PHY451
 /analysis
 /codes.venv/
+/codes
 __pycache__/
 *.pyc
 *.parquet
